@@ -1,0 +1,41 @@
+name                = "sgs-ai-widget"
+main                = "src/index.js"
+compatibility_date  = "2025-04-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev         = true
+
+[observability.logs]
+enabled         = true
+invocation_logs = true
+
+[vars]
+ENVIRONMENT       = "production"
+ALLOWED_ORIGIN    = "https://orders.stellarglobalsupplies.com"
+# Base URL of the existing orders-backend worker — used for order-query tool calls
+ORDERS_API_BASE   = "https://sgs-orders-worker.workwithprasadbhavsar.workers.dev"
+
+# D1 — separate DB from stellarai's, scoped to this widget only
+[[d1_databases]]
+binding       = "DB"
+database_name = "sgs-ai-widget-db"
+database_id   = "1ffbef1e-b8fa-4540-9668-11b57e21fadb"
+
+# Workers AI — single model handles chat, extraction, and tool-calling
+[ai]
+binding = "AI"
+
+# Browser Rendering — used only as a fallback for scanned/image-only PDFs
+# (i.e. when toMarkdown() finds no text layer). Free tier: 10 min/day,
+# 3 concurrent browsers — comfortably enough for a few orders/day.
+[browser]
+binding = "MYBROWSER"
+
+# Cron for 6-month history cleanup (mirrors stellarai)
+#[triggers]
+#crons = ["0 3 * * *"]
+
+# ── Deployment ───────────────────────────────────────────────────────────────
+# 1. wrangler d1 create sgs-order-ai-widget-db   → paste database_id above
+# 2. wrangler d1 execute sgs-order-ai-widget-db --file=schema.sql
+# 3. wrangler deploy
+# 4. In orders-frontend .env: REACT_APP_AI_WIDGET_URL = https://sgs-ai-widget.workwithprasadbhavsar.workers.dev
