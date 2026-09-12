@@ -11,8 +11,20 @@ invocation_logs = true
 [vars]
 ENVIRONMENT       = "production"
 ALLOWED_ORIGIN    = "https://orders.stellarglobalsupplies.com"
-# Base URL of the existing orders-backend worker — used for order-query tool calls
+# Kept as a fallback/reference only — NOT used for the actual tool-call fetch.
+# Cloudflare blocks a Worker from fetch()-ing another Worker's *.workers.dev
+# hostname directly (error 1042), so the real call goes through the service
+# binding below (ORDERS_API) instead of this URL.
 ORDERS_API_BASE   = "https://sgs-orders-worker.workwithprasadbhavsar.workers.dev"
+
+# Service binding to the orders-backend worker — lets this worker call it
+# directly over Cloudflare's internal network, bypassing the public-network
+# restriction (error 1042) that blocks Worker-to-Worker fetch() over
+# *.workers.dev hostnames. Update `service` if the backend's [name] in its
+# own wrangler.toml ever changes.
+[[services]]
+binding = "ORDERS_API"
+service = "sgs-orders-worker"
 
 # D1 — separate DB from stellarai's, scoped to this widget only
 [[d1_databases]]
