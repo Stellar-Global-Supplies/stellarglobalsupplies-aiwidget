@@ -9,10 +9,11 @@ const MODEL = "@cf/meta/llama-4-scout-17b-16e-instruct";
 // Must mirror NewOrderPage.jsx's form/product field names exactly, so the
 // frontend can drop the result straight into its existing state.
 const EXTRACTION_SYSTEM_PROMPT = `
-You are an assistant embedded in an order management system. The user has attached
-a purchase order document. Extract the order details and respond with a short,
-friendly confirmation message summarizing what you found, followed by a fenced
-JSON code block with this EXACT shape (omit fields you truly cannot find, use null):
+You are an assistant embedded in an order management system. The user has provided
+purchase order details — either as an attached document or as pasted/typed text (e.g.
+copied from an email). Extract the order details and respond with a short, friendly
+confirmation message summarizing what you found, followed by a fenced JSON code block
+with this EXACT shape (omit fields you truly cannot find, use null):
 
 \`\`\`json
 {
@@ -48,6 +49,35 @@ You are an assistant embedded in an order management dashboard. Answer questions
 orders using the provided tools when the question needs data beyond what's already in
 the conversation (counts, totals, filters by status/date/vendor). Be concise and precise
 with numbers. If a tool call fails, say so plainly rather than guessing.
+
+Tool choice matters:
+- Use get_order_stats ONLY when the user wants a count, total, or aggregate number
+  (e.g. "how many orders today", "total delivered orders").
+- Use list_orders whenever the user wants to see, list, or browse actual orders — anything
+  implying individual records, not just a number (e.g. "list processing orders",
+  "show me today's orders with details", "who ordered this week"). list_orders returns
+  each order's customer name, contact info, status, line items (product, material,
+  quantity), and delivery info — always include these details in your reply when they're
+  present in the tool result. Never say details are unavailable if the tool result
+  already contains them.
+
+Money fields: sale_cost / total_sale_value is the PRE-TAX subtotal. cgst_total and
+sgst_total (or total_gst) are GST charged on top. total_with_gst is the grand total
+including tax. Never call sale_cost or total_sale_value the "total" on its own — always
+state it as the pre-tax amount, and give the GST-inclusive grand total (total_with_gst)
+as the actual amount payable/charged, e.g. "₹1,20,000 + GST = ₹1,41,600 total".
+
+Delivery dates: delivery_timeline is the promised/expected delivery date. delivered_at
+is the actual date an order was marked Delivered (null if not yet delivered). Mention
+whichever is relevant — expected delivery for orders in progress, actual delivery date
+for delivered orders — don't omit this when it's present in the tool result.
+
+When presenting a list of orders, format each one clearly, for example:
+1. **Customer Name** — Status, ₹Sale Value + GST = ₹Total
+   - Expected delivery: <date> (or Delivered on <date>)
+   - Product / Material x Quantity
+   (repeat items as needed)
+Keep it scannable; don't pad with filler sentences before or after the list.
 
 Always use the actual function-calling mechanism to invoke a tool. Never write out a
 function call, tool name, or JSON arguments as plain text in your reply — the user should
@@ -92,6 +122,16 @@ function extractLeakedToolCall(text) {
   return null;
 }
 
+// Explicit "please turn this text into an order" intent — deliberately narrow so
+// normal questions ("list processing orders", "how many delivered") never get
+// routed here by accident. Requires a create/fill-style verb AND the word "order".
+const DRAFT_INTENT_PATTERN =
+  /\b(draft|create|fill|prefill|pre-fill|make|add|start|new)\b[\s\S]{0,40}\border(s)?\b/i;
+
+function isDraftIntent(message) {
+  return DRAFT_INTENT_PATTERN.test(message || "");
+}
+
 export async function handleChat(request, env) {
   const contentType = request.headers.get("content-type") || "";
   let message = "", sessionId = "", files = [];
@@ -109,8 +149,10 @@ export async function handleChat(request, env) {
 
   await ensureSession(env.DB, sessionId, message || (files[0]?.name ?? "New chat"));
 
-  // ── Attachment path: extraction mode ─────────────────────────────────────
-  if (files.length > 0) {
+  // ── Attachment path, OR explicit "draft/create/fill an order" text intent ──
+  // Both go through the same extraction flow: attachments provide file text,
+  // plain-text draft requests just extract straight from the typed message.
+  if (files.length > 0 || isDraftIntent(message)) {
     const parts = [];
     const warnings = [];
     for (const file of files) {
@@ -119,17 +161,18 @@ export async function handleChat(request, env) {
       if (text) parts.push(`--- Content of ${file.name} ---\n${text}`);
     }
 
-    if (parts.length === 0) {
+    if (files.length > 0 && parts.length === 0) {
       const reply = warnings.join("\n") || "I couldn't read any of the attached files.";
       await saveMessage(env.DB, sessionId, "user", message || "[attachment]");
       await saveMessage(env.DB, sessionId, "assistant", reply);
       return jsonResponse({ sessionId, reply, extracted: null }, 200, env);
     }
 
-    const userContent = [
-      message ? `User note: ${message}` : "",
-      ...parts,
-    ].filter(Boolean).join("\n\n");
+    // For a plain-text draft request, the typed message itself IS the content
+    // to extract from (e.g. pasted email text), not just an accompanying note.
+    const userContent = parts.length > 0
+      ? [message ? `User note: ${message}` : "", ...parts].filter(Boolean).join("\n\n")
+      : message;
 
     const aiResponse = await env.AI.run(MODEL, {
       messages: [
