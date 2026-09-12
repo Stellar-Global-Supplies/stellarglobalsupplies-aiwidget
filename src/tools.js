@@ -42,7 +42,17 @@ export const TOOL_DEFINITIONS = [
 ];
 
 export async function executeTool(name, args, env) {
-  const base = env.ORDERS_API_BASE;
+  // Service binding to the orders-backend worker (see wrangler.toml `[[services]]`).
+  // A plain fetch() to the backend's *.workers.dev URL is blocked by Cloudflare
+  // at the network level (error 1042: Workers can't fetch another Worker's
+  // workers.dev hostname over the public network). The binding calls it
+  // directly over Cloudflare's internal network instead, which is both the
+  // fix for that error and the recommended way to do Worker-to-Worker calls.
+  const backend = env.ORDERS_API;
+  // Path/host here just need to be well-formed — the binding routes to the
+  // bound service regardless of hostname, but keep it consistent with the
+  // backend's real routes for clarity and in case of local `wrangler dev`.
+  const origin = env.ORDERS_API_BASE || "https://sgs-orders-worker.internal";
 
   if (name === "get_order_stats") {
     const params = new URLSearchParams();
@@ -52,9 +62,9 @@ export async function executeTool(name, args, env) {
     if (args.customer_name) params.set("customer_name", args.customer_name);
 
     const qs  = params.toString();
-    const url = `${base}/orders/stats${qs ? `?${qs}` : ""}`;
-    console.log("[tools] get_order_stats fetching:", url, "base was:", JSON.stringify(base));
-    const res = await fetch(url);
+    const url = `${origin}/orders/stats${qs ? `?${qs}` : ""}`;
+    console.log("[tools] get_order_stats fetching via service binding:", url);
+    const res = await backend.fetch(url);
     if (!res.ok) {
       const bodyText = await res.text().catch(() => "<unreadable>");
       console.log("[tools] get_order_stats failed body:", bodyText.slice(0, 300));
@@ -64,10 +74,13 @@ export async function executeTool(name, args, env) {
   }
 
   if (name === "get_order_by_id") {
-    const url = `${base}/orders/${encodeURIComponent(args.order_id)}/summary`;
-    console.log("[tools] get_order_by_id fetching:", url, "base was:", JSON.stringify(base));
-    const res = await fetch(url);
-    if (!res.ok) return { error: `orders-backend returned ${res.status}`, url };
+    const url = `${origin}/orders/${encodeURIComponent(args.order_id)}/summary`;
+    console.log("[tools] get_order_by_id fetching via service binding:", url);
+    const res = await backend.fetch(url);
+    if (!res.ok) {
+      const bodyText = await res.text().catch(() => "<unreadable>");
+      return { error: `orders-backend returned ${res.status}`, url, body: bodyText.slice(0, 300) };
+    }
     return await res.json();
   }
 
