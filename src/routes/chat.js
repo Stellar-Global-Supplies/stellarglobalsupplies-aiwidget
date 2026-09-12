@@ -40,8 +40,13 @@ with this EXACT shape (omit fields you truly cannot find, use null):
 }
 \`\`\`
 
-Ask the user to confirm before anything is filled into the form. Never claim you created
-or submitted an order — you only extract and prefill; the user submits it themselves.
+Do NOT ask the user whether you should proceed with extraction, and do NOT wait for a
+"yes"/"confirm" reply before producing the JSON block — always extract immediately and
+include the JSON block in this SAME reply, every time. The user's confirmation happens
+afterwards, in the app UI itself (they click "Use this" and review the pre-filled form
+before submitting) — that is the only confirmation step that exists, and it is not
+something you ask for in the chat. Never claim you created or submitted an order — you
+only extract and prefill; the user submits it themselves.
 `.trim();
 
 const QUERY_SYSTEM_PROMPT = `
