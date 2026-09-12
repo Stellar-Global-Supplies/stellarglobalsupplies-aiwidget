@@ -55,7 +55,11 @@ export async function executeTool(name, args, env) {
     const url = `${base}/orders/stats${qs ? `?${qs}` : ""}`;
     console.log("[tools] get_order_stats fetching:", url, "base was:", JSON.stringify(base));
     const res = await fetch(url);
-    if (!res.ok) return { error: `orders-backend returned ${res.status}`, url };
+    if (!res.ok) {
+      const bodyText = await res.text().catch(() => "<unreadable>");
+      console.log("[tools] get_order_stats failed body:", bodyText.slice(0, 300));
+      return { error: `orders-backend returned ${res.status}`, url, body: bodyText.slice(0, 300) };
+    }
     return await res.json();
   }
 
