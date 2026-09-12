@@ -51,14 +51,19 @@ export async function executeTool(name, args, env) {
     if (args.date_to)       params.set("date_to", args.date_to);
     if (args.customer_name) params.set("customer_name", args.customer_name);
 
-    const res = await fetch(`${base}/orders/stats?${params}`);
-    if (!res.ok) return { error: `orders-backend returned ${res.status}` };
+    const qs  = params.toString();
+    const url = `${base}/orders/stats${qs ? `?${qs}` : ""}`;
+    console.log("[tools] get_order_stats fetching:", url, "base was:", JSON.stringify(base));
+    const res = await fetch(url);
+    if (!res.ok) return { error: `orders-backend returned ${res.status}`, url };
     return await res.json();
   }
 
   if (name === "get_order_by_id") {
-    const res = await fetch(`${base}/orders/${encodeURIComponent(args.order_id)}/summary`);
-    if (!res.ok) return { error: `orders-backend returned ${res.status}` };
+    const url = `${base}/orders/${encodeURIComponent(args.order_id)}/summary`;
+    console.log("[tools] get_order_by_id fetching:", url, "base was:", JSON.stringify(base));
+    const res = await fetch(url);
+    if (!res.ok) return { error: `orders-backend returned ${res.status}`, url };
     return await res.json();
   }
 
