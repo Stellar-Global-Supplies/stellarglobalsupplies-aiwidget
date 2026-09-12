@@ -172,7 +172,14 @@ export async function handleChat(request, env) {
       if (leaked) calls = [leaked];
     }
 
-    if (calls.length === 0) break;
+    if (calls.length === 0) {
+      if (round === 0) {
+        console.log("[chat] no tool_calls on first response; raw response was:", JSON.stringify(aiResponse?.response));
+      }
+      break;
+    }
+
+    console.log("[chat] tool call(s) requested:", JSON.stringify(calls));
 
     // Normalize into the strict OpenAI-style shape the Workers AI endpoint
     // requires on the *next* request (id, type, function.{name,arguments}).
@@ -191,6 +198,7 @@ export async function handleChat(request, env) {
     for (const call of normalizedCalls) {
       const args = JSON.parse(call.function.arguments || "{}");
       const result = await executeTool(call.function.name, args, env);
+      console.log(`[chat] executeTool(${call.function.name}, ${JSON.stringify(args)}) →`, JSON.stringify(result));
       toolResults.push({
         role: "tool",
         tool_call_id: call.id,
