@@ -39,6 +39,31 @@ export const TOOL_DEFINITIONS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "list_orders",
+      description:
+        "List individual orders with full details (customer name, contact info, status, line items, sale value) — " +
+        "optionally filtered by status, date range, and/or customer name. Use this whenever the user wants to see " +
+        "or browse actual orders (e.g. 'list processing orders', 'show me today's orders with details'), as opposed " +
+        "to get_order_stats which only returns counts/totals. Returns at most 20 orders per call.",
+      parameters: {
+        type: "object",
+        properties: {
+          status: {
+            type: "string",
+            enum: ["Order Received", "Processing", "Ready to Dispatch", "Delivered"],
+            description: "Filter by order status. Omit for all statuses.",
+          },
+          date_from: { type: "string", description: "ISO date (YYYY-MM-DD), inclusive. Omit for no lower bound." },
+          date_to:   { type: "string", description: "ISO date (YYYY-MM-DD), inclusive. Omit for no upper bound." },
+          customer_name: { type: "string", description: "Filter by customer name (partial match). Omit for all customers." },
+          limit: { type: "number", description: "Max orders to return (default 10, max 20)." },
+        },
+      },
+    },
+  },
 ];
 
 export async function executeTool(name, args, env) {
@@ -76,6 +101,25 @@ export async function executeTool(name, args, env) {
   if (name === "get_order_by_id") {
     const url = `${origin}/orders/${encodeURIComponent(args.order_id)}/summary`;
     console.log("[tools] get_order_by_id fetching via service binding:", url);
+    const res = await backend.fetch(url);
+    if (!res.ok) {
+      const bodyText = await res.text().catch(() => "<unreadable>");
+      return { error: `orders-backend returned ${res.status}`, url, body: bodyText.slice(0, 300) };
+    }
+    return await res.json();
+  }
+
+  if (name === "list_orders") {
+    const params = new URLSearchParams();
+    if (args.status)        params.set("status", args.status);
+    if (args.date_from)     params.set("date_from", args.date_from);
+    if (args.date_to)       params.set("date_to", args.date_to);
+    if (args.customer_name) params.set("customer_name", args.customer_name);
+    if (args.limit)         params.set("limit", String(args.limit));
+
+    const qs  = params.toString();
+    const url = `${origin}/orders/list${qs ? `?${qs}` : ""}`;
+    console.log("[tools] list_orders fetching via service binding:", url);
     const res = await backend.fetch(url);
     if (!res.ok) {
       const bodyText = await res.text().catch(() => "<unreadable>");
