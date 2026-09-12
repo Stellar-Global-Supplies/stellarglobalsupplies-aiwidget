@@ -184,11 +184,33 @@ export async function handleChat(request, env) {
         { role: "system", content: EXTRACTION_SYSTEM_PROMPT },
         { role: "user", content: userContent },
       ],
+      // Extraction JSON (form + multiple products) can be long — the default
+      // output limit was truncating it mid-object on bigger POs, producing
+      // invalid/partial JSON that silently failed to parse (or worse, parsed
+      // into a near-empty object that still rendered a "Use this" button but
+      // filled nothing).
+      max_tokens: 2048,
     });
 
     const raw = aiResponse?.response || "";
-    const extracted = parseExtractedJson(raw);
-    const replyText  = stripJsonBlock(raw) + (warnings.length ? `\n\n_Note: ${warnings.join(" ")}_` : "");
+    const { extracted: rawExtracted, displayText } = extractJsonFromReply(raw);
+    let extracted = rawExtracted;
+
+    // Guard against a "successfully parsed but useless" result: valid JSON
+    // that's missing the shape the form needs (e.g. truncated mid-object, or
+    // the model echoed the template without filling it in). Treat that the
+    // same as a failed extraction rather than surfacing a button that fills
+    // nothing when clicked.
+    if (extracted && !hasUsableExtraction(extracted)) {
+      console.log("[chat] discarding unusable extraction:", JSON.stringify(extracted));
+      extracted = null;
+    }
+    const stripped = displayText + (warnings.length ? `\n\n_Note: ${warnings.join(" ")}_` : "");
+    const replyText = stripped.trim() || (
+      extracted
+        ? "Here's what I found — please review before submitting."
+        : "I couldn't reliably extract the order details from that — could you try re-attaching the file, or pasting the text again?"
+    );
 
     await saveMessage(env.DB, sessionId, "user", message || `[attached: ${files.map(f => f.name).join(", ")}]`);
     await saveMessage(env.DB, sessionId, "assistant", replyText, extracted);
@@ -277,12 +299,47 @@ export async function handleChat(request, env) {
   return jsonResponse({ sessionId, reply, extracted: null }, 200, env);
 }
 
-function parseExtractedJson(raw) {
-  const match = raw.match(/```json\s*([\s\S]*?)```/);
-  if (!match) return null;
-  try { return JSON.parse(match[1]); } catch { return null; }
+// Parses the JSON code block out of the model's reply AND returns the reply
+// text with that block removed, in one pass — so both stay in sync even when
+// the model forgets the ```json fence or the response got cut off mid-object.
+function extractJsonFromReply(raw) {
+  const fenced = raw.match(/```json\s*([\s\S]*?)```/i);
+  if (fenced) {
+    try {
+      return { extracted: JSON.parse(fenced[1]), displayText: raw.replace(fenced[0], "").trim() };
+    } catch { /* fall through to brace-matching below */ }
+  }
+
+  // Fallback: the fence may be missing (model forgot it), or the closing ```
+  // never arrived because the response got truncated. Try to locate a
+  // balanced {...} span starting at the first "{" and parse that instead.
+  const start = raw.indexOf("{");
+  if (start !== -1) {
+    let depth = 0;
+    for (let i = start; i < raw.length; i++) {
+      if (raw[i] === "{") depth++;
+      else if (raw[i] === "}") {
+        depth--;
+        if (depth === 0) {
+          try {
+            const extracted = JSON.parse(raw.slice(start, i + 1));
+            return { extracted, displayText: (raw.slice(0, start) + raw.slice(i + 1)).trim() };
+          } catch { break; } // fall through to "no JSON found" below
+        }
+      }
+    }
+  }
+
+  return { extracted: null, displayText: raw.trim() };
 }
 
-function stripJsonBlock(raw) {
-  return raw.replace(/```json\s*[\s\S]*?```/, "").trim();
+// A successfully-parsed object is still useless to the form if it's missing
+// the shape entirely, or every field is empty — that happens when the model
+// echoes the template without actually filling it in, or the JSON got cut
+// off after just `{ "form": {` with nothing usable inside.
+function hasUsableExtraction(extracted) {
+  const hasCustomerName = !!extracted?.form?.customer_name?.trim?.();
+  const hasProducts = Array.isArray(extracted?.products) &&
+    extracted.products.some(p => p?.product_type?.trim?.() || p?.material?.trim?.());
+  return hasCustomerName || hasProducts;
 }
