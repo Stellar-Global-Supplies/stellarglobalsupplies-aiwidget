@@ -48,7 +48,49 @@ You are an assistant embedded in an order management dashboard. Answer questions
 orders using the provided tools when the question needs data beyond what's already in
 the conversation (counts, totals, filters by status/date/vendor). Be concise and precise
 with numbers. If a tool call fails, say so plainly rather than guessing.
+
+Always use the actual function-calling mechanism to invoke a tool. Never write out a
+function call, tool name, or JSON arguments as plain text in your reply — the user should
+only ever see a natural-language answer, never the mechanics of how you got it.
 `.trim();
+
+// Matches a handful of ways small/instruction-tuned models sometimes leak a tool call as
+// plain text instead of using the real function-calling channel, e.g.:
+//   <function=get_order_stats>{"status": "Order Received"}</function>
+//   [get_order_stats(status="Order Received")]
+//   get_order_stats({"status": "Order Received"})
+const LEAKED_CALL_PATTERNS = [
+  /<function=([a-zA-Z0-9_]+)>\s*(\{[\s\S]*?\})?\s*<\/function>/,
+  /\[?([a-zA-Z0-9_]+)\((\{[\s\S]*?\}|[^)]*)\)\]?/,
+];
+
+function extractLeakedToolCall(text) {
+  if (!text) return null;
+  const knownNames = TOOL_DEFINITIONS.map(t => t.function.name);
+
+  for (const pattern of LEAKED_CALL_PATTERNS) {
+    const match = text.match(pattern);
+    if (!match) continue;
+    const name = match[1];
+    if (!knownNames.includes(name)) continue;
+
+    let args = {};
+    const rawArgs = match[2] || "";
+    if (rawArgs.trim().startsWith("{")) {
+      try { args = JSON.parse(rawArgs); } catch { args = {}; }
+    } else if (rawArgs.trim()) {
+      // key="value", key2="value2" style
+      for (const pair of rawArgs.split(",")) {
+        const kv = pair.split("=");
+        if (kv.length === 2) {
+          args[kv[0].trim()] = kv[1].trim().replace(/^["']|["']$/g, "");
+        }
+      }
+    }
+    return { name, arguments: args };
+  }
+  return null;
+}
 
 export async function handleChat(request, env) {
   const contentType = request.headers.get("content-type") || "";
@@ -114,23 +156,64 @@ export async function handleChat(request, env) {
     { role: "user", content: message },
   ];
 
-  let aiResponse = await env.AI.run(MODEL, { messages, tools: TOOL_DEFINITIONS });
+  let conversation = [...messages];
+  let aiResponse = await env.AI.run(MODEL, { messages: conversation, tools: TOOL_DEFINITIONS });
 
-  // Handle one round of tool calls (sufficient for count/lookup style questions)
-  if (aiResponse?.tool_calls?.length) {
-    const toolResults = [];
-    for (const call of aiResponse.tool_calls) {
-      const args = typeof call.arguments === "string" ? JSON.parse(call.arguments) : call.arguments;
-      const result = await executeTool(call.name, args || {}, env);
-      toolResults.push({ role: "tool", name: call.name, content: JSON.stringify(result) });
+  // Handle up to a couple of rounds of tool calls (sufficient for count/lookup
+  // style questions, with room for one follow-up call e.g. stats -> detail).
+  const MAX_TOOL_ROUNDS = 3;
+  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+    let calls = aiResponse?.tool_calls || [];
+
+    // Fallback: some model responses leak the call as plain text in `.response`
+    // instead of populating `.tool_calls`. Detect and treat it the same way.
+    if (calls.length === 0) {
+      const leaked = extractLeakedToolCall(aiResponse?.response);
+      if (leaked) calls = [leaked];
     }
-    aiResponse = await env.AI.run(MODEL, {
-      messages: [...messages, { role: "assistant", content: "", tool_calls: aiResponse.tool_calls }, ...toolResults],
-      tools: TOOL_DEFINITIONS,
-    });
+
+    if (calls.length === 0) break;
+
+    // Normalize into the strict OpenAI-style shape the Workers AI endpoint
+    // requires on the *next* request (id, type, function.{name,arguments}).
+    // The model's own tool_calls output only reliably includes name/arguments,
+    // which is what caused the 400/500 "Field required" errors.
+    const normalizedCalls = calls.map((call, i) => ({
+      id: call.id || `call_${crypto.randomUUID().slice(0, 8)}_${i}`,
+      type: "function",
+      function: {
+        name: call.name,
+        arguments: typeof call.arguments === "string" ? call.arguments : JSON.stringify(call.arguments || {}),
+      },
+    }));
+
+    const toolResults = [];
+    for (const call of normalizedCalls) {
+      const args = JSON.parse(call.function.arguments || "{}");
+      const result = await executeTool(call.function.name, args, env);
+      toolResults.push({
+        role: "tool",
+        tool_call_id: call.id,
+        content: JSON.stringify(result),
+      });
+    }
+
+    conversation = [
+      ...conversation,
+      { role: "assistant", content: aiResponse?.response || "", tool_calls: normalizedCalls },
+      ...toolResults,
+    ];
+
+    aiResponse = await env.AI.run(MODEL, { messages: conversation, tools: TOOL_DEFINITIONS });
   }
 
-  const reply = aiResponse?.response?.trim() || "Sorry, I couldn't process that.";
+  let reply = aiResponse?.response?.trim() || "Sorry, I couldn't process that.";
+
+  // Safety net: never let a leaked function-call string reach the user, even
+  // if it slipped through after the tool-call rounds above.
+  if (extractLeakedToolCall(reply)) {
+    reply = "Sorry, I ran into a problem answering that — could you rephrase the question?";
+  }
 
   await saveMessage(env.DB, sessionId, "user", message);
   await saveMessage(env.DB, sessionId, "assistant", reply);
