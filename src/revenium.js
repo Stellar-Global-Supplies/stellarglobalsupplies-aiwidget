@@ -42,7 +42,7 @@ async function getReveniumApiKey(env) {
   }
   
   const REVENIUM_METERING_URL =
-    "https://api.revenium.io/meter/v2/ai/completions";
+    "https://api.revenium.ai/meter/v2/ai/completions";
   
   const ORGANIZATION_ID = "Stellar Global Supplies";
   const PRODUCT_ID = "stellar-ai-widget";
