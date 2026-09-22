@@ -2,6 +2,7 @@ import { extractFromFile }              from "../extract.js";
 import { TOOL_DEFINITIONS, executeTool } from "../tools.js";
 import { ensureSession, saveMessage, getHistory } from "../db.js";
 import { jsonResponse } from "../cors.js";
+import { reportUsage } from "../revenium.js";
 
 // Single model for chat, extraction, and tool-calling (multimodal + function calling)
 const MODEL = "@cf/meta/llama-4-scout-17b-16e-instruct";
@@ -137,7 +138,7 @@ function isDraftIntent(message) {
   return DRAFT_INTENT_PATTERN.test(message || "");
 }
 
-export async function handleChat(request, env) {
+export async function handleChat(request, env, ctx) {
   const contentType = request.headers.get("content-type") || "";
   let message = "", sessionId = "", files = [];
 
@@ -179,6 +180,7 @@ export async function handleChat(request, env) {
       ? [message ? `User note: ${message}` : "", ...parts].filter(Boolean).join("\n\n")
       : message;
 
+    const extractionCallStart = Date.now();
     const aiResponse = await env.AI.run(MODEL, {
       messages: [
         { role: "system", content: EXTRACTION_SYSTEM_PROMPT },
@@ -191,6 +193,14 @@ export async function handleChat(request, env) {
       // filled nothing).
       max_tokens: 2048,
     });
+
+    ctx?.waitUntil(reportUsage(env, {
+      model: MODEL,
+      sessionId,
+      usage: aiResponse?.usage,
+      operationType: "CHAT",
+      requestStartTime: extractionCallStart,
+    }));
 
     const raw = aiResponse?.response || "";
     const { extracted: rawExtracted, displayText } = extractJsonFromReply(raw);
@@ -227,7 +237,15 @@ export async function handleChat(request, env) {
   ];
 
   let conversation = [...messages];
+  let queryCallStart = Date.now();
   let aiResponse = await env.AI.run(MODEL, { messages: conversation, tools: TOOL_DEFINITIONS });
+  ctx?.waitUntil(reportUsage(env, {
+    model: MODEL,
+    sessionId,
+    usage: aiResponse?.usage,
+    operationType: "CHAT",
+    requestStartTime: queryCallStart,
+  }));
 
   // Handle up to a couple of rounds of tool calls (sufficient for count/lookup
   // style questions, with room for one follow-up call e.g. stats -> detail).
@@ -282,7 +300,15 @@ export async function handleChat(request, env) {
       ...toolResults,
     ];
 
+    queryCallStart = Date.now();
     aiResponse = await env.AI.run(MODEL, { messages: conversation, tools: TOOL_DEFINITIONS });
+    ctx?.waitUntil(reportUsage(env, {
+      model: MODEL,
+      sessionId,
+      usage: aiResponse?.usage,
+      operationType: "CHAT",
+      requestStartTime: queryCallStart,
+    }));
   }
 
   let reply = aiResponse?.response?.trim() || "Sorry, I couldn't process that.";

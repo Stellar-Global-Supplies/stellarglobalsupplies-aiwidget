@@ -46,8 +46,24 @@ binding = "MYBROWSER"
 #[triggers]
 #crons = ["0 3 * * *"]
 
+# Revenium AI metering — Cloudflare Secrets Store binding (account-level,
+# shared across Workers/products — not a per-Worker `wrangler secret`).
+# store_id: your Secrets Store ID (Dashboard → Secrets Store, or
+#           `wrangler secrets-store store list --remote`)
+# secret_name: the name you gave the secret when you created it
+# Accessed in code via: await env.REVENIUM_API_KEY.get()  (see src/revenium.js)
+[[secrets_store_secrets]]
+binding     = "REVENIUM_API_KEY"
+store_id    = "2556bcd9458349f6b4ff2a3fc93bdba1"
+secret_name = "REVENIUM_API_KEY"
+
 # ── Deployment ───────────────────────────────────────────────────────────────
 # 1. wrangler d1 create sgs-order-ai-widget-db   → paste database_id above
 # 2. wrangler d1 execute sgs-order-ai-widget-db --file=schema.sql
-# 3. wrangler deploy
-# 4. In orders-frontend .env: REACT_APP_AI_WIDGET_URL = https://sgs-ai-widget.workwithprasadbhavsar.workers.dev
+# 3. One-time, if you don't already have a store/secret for this key:
+#      wrangler secrets-store store create default --remote        (if no store yet)
+#      wrangler secrets-store secret create <STORE_ID> \
+#        --name REVENIUM_API_KEY --scopes workers --remote
+#    Then paste the real store_id above into [[secrets_store_secrets]].
+# 4. wrangler deploy
+# 5. In orders-frontend .env: REACT_APP_AI_WIDGET_URL = https://sgs-ai-widget.workwithprasadbhavsar.workers.dev

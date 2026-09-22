@@ -15,7 +15,7 @@ import { getSessionHistory, clearSession }     from "./routes/history.js";
 import { preflightResponse, jsonResponse }     from "./cors.js";
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url    = new URL(request.url);
     const path   = url.pathname;
     const method = request.method.toUpperCase();
@@ -23,7 +23,7 @@ export default {
     if (method === "OPTIONS") return preflightResponse(env);
 
     try {
-      if (path === "/chat" && method === "POST") return await handleChat(request, env);
+      if (path === "/chat" && method === "POST") return await handleChat(request, env, ctx);
 
       const historyMatch = path.match(/^\/history\/([^/]+)$/);
       if (historyMatch) {
