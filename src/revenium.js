@@ -2,12 +2,6 @@
  * Revenium AI metering for Cloudflare Workers
  *
  * Provider + modelSource are automatically detected from the model name.
- *
- * Existing configuration intentionally kept unchanged:
- * - Organization: Stellar Global Supplies
- * - Product: stellar-ai-widget
- * - Revenium endpoint
- * - x-api-key authentication
  */
 
 const REVENIUM_METERING_URL =
@@ -26,12 +20,10 @@ async function getReveniumApiKey(env) {
     return null;
   }
 
-  // Normal Wrangler secret / environment variable
   if (typeof binding === "string") {
     return binding.trim();
   }
 
-  // Cloudflare Secrets Store
   if (typeof binding.get === "function") {
     try {
       const value = await binding.get();
@@ -57,31 +49,21 @@ async function getReveniumApiKey(env) {
 /**
  * Dynamically determine provider and model source.
  *
- * Examples:
+ * Cloudflare:
  *
  * @cf/meta/llama-4-scout...
- *   provider     = Meta
- *   modelSource  = Cloudflare
+ *   provider    = cloudflare
+ *   modelSource = Cloudflare
  *
  * @cf/mistral/...
- *   provider     = Mistral
- *   modelSource  = Cloudflare
+ *   provider    = cloudflare
+ *   modelSource = Cloudflare
  *
  * @cf/deepseek/...
- *   provider     = DeepSeek
- *   modelSource  = Cloudflare
+ *   provider    = cloudflare
+ *   modelSource = Cloudflare
  *
- * gpt-4o
- *   provider     = OpenAI
- *   modelSource  = DIRECT
- *
- * claude-3-5-sonnet
- *   provider     = Anthropic
- *   modelSource  = DIRECT
- *
- * gemini-2.5-flash
- *   provider     = Google
- *   modelSource  = DIRECT
+ * Other direct providers are detected from model name.
  */
 function inferProviderAndSource(model) {
   const value = String(model || "").toLowerCase();
@@ -90,90 +72,16 @@ function inferProviderAndSource(model) {
    * ----------------------------------------
    * Cloudflare Workers AI
    * ----------------------------------------
+   *
+   * IMPORTANT:
+   * Revenium's pricing catalog for your
+   * @cf/... model is registered under
+   * provider = cloudflare.
    */
 
   if (value.startsWith("@cf/")) {
-    const cfModel = value.slice(4);
-
-    // Meta / Llama
-    if (
-      cfModel.startsWith("meta/") ||
-      cfModel.includes("llama")
-    ) {
-      return {
-        provider: "Meta",
-        modelSource: "Cloudflare",
-      };
-    }
-
-    // Mistral
-    if (
-      cfModel.startsWith("mistral/") ||
-      cfModel.includes("mistral")
-    ) {
-      return {
-        provider: "Mistral",
-        modelSource: "Cloudflare",
-      };
-    }
-
-    // DeepSeek
-    if (
-      cfModel.startsWith("deepseek/") ||
-      cfModel.includes("deepseek")
-    ) {
-      return {
-        provider: "DeepSeek",
-        modelSource: "Cloudflare",
-      };
-    }
-
-    // Qwen
-    if (
-      cfModel.startsWith("qwen/") ||
-      cfModel.includes("qwen")
-    ) {
-      return {
-        provider: "Qwen",
-        modelSource: "Cloudflare",
-      };
-    }
-
-    // Google / Gemma
-    if (
-      cfModel.startsWith("google/") ||
-      cfModel.includes("gemma")
-    ) {
-      return {
-        provider: "Google",
-        modelSource: "Cloudflare",
-      };
-    }
-
-    // BAAI / BGE
-    if (
-      cfModel.startsWith("baai/") ||
-      cfModel.includes("bge")
-    ) {
-      return {
-        provider: "BAAI",
-        modelSource: "Cloudflare",
-      };
-    }
-
-    /*
-     * Unknown @cf model.
-     *
-     * Use the namespace after @cf/ as provider.
-     */
-    const namespace = cfModel.split("/")[0];
-
     return {
-      provider: namespace
-        ? namespace.charAt(0).toUpperCase() +
-          namespace.slice(1)
-        : "Cloudflare",
-
+      provider: "cloudflare",
       modelSource: "Cloudflare",
     };
   }
@@ -287,7 +195,9 @@ function inferProviderAndSource(model) {
   }
 
   /*
-   * Unknown provider.
+   * ----------------------------------------
+   * Unknown provider
+   * ----------------------------------------
    */
 
   return {
@@ -470,8 +380,6 @@ export async function reportUsage(
 
   /*
    * Revenium payload.
-   *
-   * Organization and product remain unchanged.
    */
 
   const payload = {
@@ -565,10 +473,6 @@ export async function reportUsage(
             "x-api-key":
               apiKey,
 
-            /*
-             * Prevent duplicate
-             * events on retry.
-             */
             "Idempotency-Key":
               transactionId,
           },
