@@ -1,11 +1,13 @@
 /**
  * Revenium AI metering for Cloudflare Workers
  *
- * Current endpoint:
- * POST https://api.revenium.ai/meter/v2/ai/completions
+ * Provider + modelSource are automatically detected from the model name.
  *
- * Authentication:
- * x-api-key: <Revenium API key>
+ * Existing configuration intentionally kept unchanged:
+ * - Organization: Stellar Global Supplies
+ * - Product: stellar-ai-widget
+ * - Revenium endpoint
+ * - x-api-key authentication
  */
 
 const REVENIUM_METERING_URL =
@@ -13,12 +15,9 @@ const REVENIUM_METERING_URL =
 
 const ORGANIZATION_NAME = "Stellar Global Supplies";
 const PRODUCT_NAME = "stellar-ai-widget";
-const PROVIDER = "Cloudflare";
 
 /**
- * Resolve Revenium API key from:
- * - normal Worker env variable / Wrangler secret
- * - Cloudflare Secrets Store binding
+ * Resolve Revenium API key.
  */
 async function getReveniumApiKey(env) {
   const binding = env.REVENIUM_API_KEY;
@@ -56,7 +55,249 @@ async function getReveniumApiKey(env) {
 }
 
 /**
- * Normalize Workers AI usage into Revenium's expected token fields.
+ * Dynamically determine provider and model source.
+ *
+ * Examples:
+ *
+ * @cf/meta/llama-4-scout...
+ *   provider     = Meta
+ *   modelSource  = Cloudflare
+ *
+ * @cf/mistral/...
+ *   provider     = Mistral
+ *   modelSource  = Cloudflare
+ *
+ * @cf/deepseek/...
+ *   provider     = DeepSeek
+ *   modelSource  = Cloudflare
+ *
+ * gpt-4o
+ *   provider     = OpenAI
+ *   modelSource  = DIRECT
+ *
+ * claude-3-5-sonnet
+ *   provider     = Anthropic
+ *   modelSource  = DIRECT
+ *
+ * gemini-2.5-flash
+ *   provider     = Google
+ *   modelSource  = DIRECT
+ */
+function inferProviderAndSource(model) {
+  const value = String(model || "").toLowerCase();
+
+  /*
+   * ----------------------------------------
+   * Cloudflare Workers AI
+   * ----------------------------------------
+   */
+
+  if (value.startsWith("@cf/")) {
+    const cfModel = value.slice(4);
+
+    // Meta / Llama
+    if (
+      cfModel.startsWith("meta/") ||
+      cfModel.includes("llama")
+    ) {
+      return {
+        provider: "Meta",
+        modelSource: "Cloudflare",
+      };
+    }
+
+    // Mistral
+    if (
+      cfModel.startsWith("mistral/") ||
+      cfModel.includes("mistral")
+    ) {
+      return {
+        provider: "Mistral",
+        modelSource: "Cloudflare",
+      };
+    }
+
+    // DeepSeek
+    if (
+      cfModel.startsWith("deepseek/") ||
+      cfModel.includes("deepseek")
+    ) {
+      return {
+        provider: "DeepSeek",
+        modelSource: "Cloudflare",
+      };
+    }
+
+    // Qwen
+    if (
+      cfModel.startsWith("qwen/") ||
+      cfModel.includes("qwen")
+    ) {
+      return {
+        provider: "Qwen",
+        modelSource: "Cloudflare",
+      };
+    }
+
+    // Google / Gemma
+    if (
+      cfModel.startsWith("google/") ||
+      cfModel.includes("gemma")
+    ) {
+      return {
+        provider: "Google",
+        modelSource: "Cloudflare",
+      };
+    }
+
+    // BAAI / BGE
+    if (
+      cfModel.startsWith("baai/") ||
+      cfModel.includes("bge")
+    ) {
+      return {
+        provider: "BAAI",
+        modelSource: "Cloudflare",
+      };
+    }
+
+    /*
+     * Unknown @cf model.
+     *
+     * Use the namespace after @cf/ as provider.
+     */
+    const namespace = cfModel.split("/")[0];
+
+    return {
+      provider: namespace
+        ? namespace.charAt(0).toUpperCase() +
+          namespace.slice(1)
+        : "Cloudflare",
+
+      modelSource: "Cloudflare",
+    };
+  }
+
+  /*
+   * ----------------------------------------
+   * OpenAI
+   * ----------------------------------------
+   */
+
+  if (
+    value.includes("gpt-") ||
+    value.includes("o1") ||
+    value.includes("o3") ||
+    value.includes("o4")
+  ) {
+    return {
+      provider: "OpenAI",
+      modelSource: "DIRECT",
+    };
+  }
+
+  /*
+   * ----------------------------------------
+   * Anthropic
+   * ----------------------------------------
+   */
+
+  if (
+    value.includes("claude") ||
+    value.includes("anthropic")
+  ) {
+    return {
+      provider: "Anthropic",
+      modelSource: "DIRECT",
+    };
+  }
+
+  /*
+   * ----------------------------------------
+   * Google
+   * ----------------------------------------
+   */
+
+  if (
+    value.includes("gemini") ||
+    value.includes("gemma")
+  ) {
+    return {
+      provider: "Google",
+      modelSource: "DIRECT",
+    };
+  }
+
+  /*
+   * ----------------------------------------
+   * Mistral
+   * ----------------------------------------
+   */
+
+  if (
+    value.includes("mistral") ||
+    value.includes("mixtral")
+  ) {
+    return {
+      provider: "Mistral",
+      modelSource: "DIRECT",
+    };
+  }
+
+  /*
+   * ----------------------------------------
+   * DeepSeek
+   * ----------------------------------------
+   */
+
+  if (value.includes("deepseek")) {
+    return {
+      provider: "DeepSeek",
+      modelSource: "DIRECT",
+    };
+  }
+
+  /*
+   * ----------------------------------------
+   * Meta / Llama
+   * ----------------------------------------
+   */
+
+  if (value.includes("llama")) {
+    return {
+      provider: "Meta",
+      modelSource: "DIRECT",
+    };
+  }
+
+  /*
+   * ----------------------------------------
+   * Cohere
+   * ----------------------------------------
+   */
+
+  if (
+    value.includes("command-r") ||
+    value.includes("cohere")
+  ) {
+    return {
+      provider: "Cohere",
+      modelSource: "DIRECT",
+    };
+  }
+
+  /*
+   * Unknown provider.
+   */
+
+  return {
+    provider: "Unknown",
+    modelSource: "DIRECT",
+  };
+}
+
+/**
+ * Normalize token usage.
  */
 function normalizeUsage(usage) {
   if (!usage) {
@@ -64,6 +305,7 @@ function normalizeUsage(usage) {
       inputTokenCount: 0,
       outputTokenCount: 0,
       totalTokenCount: 0,
+      reasoningTokenCount: null,
     };
   }
 
@@ -71,6 +313,7 @@ function normalizeUsage(usage) {
     usage.prompt_tokens ??
       usage.input_tokens ??
       usage.inputTokenCount ??
+      usage.promptTokens ??
       0
   );
 
@@ -78,127 +321,45 @@ function normalizeUsage(usage) {
     usage.completion_tokens ??
       usage.output_tokens ??
       usage.outputTokenCount ??
+      usage.completionTokens ??
       0
   );
 
   const totalTokenCount = Number(
     usage.total_tokens ??
       usage.totalTokenCount ??
+      usage.totalTokens ??
       inputTokenCount + outputTokenCount
   );
+
+  const reasoningTokenCount =
+    usage.reasoning_tokens ??
+    usage.reasoningTokenCount ??
+    usage.reasoningTokens ??
+    null;
 
   return {
     inputTokenCount,
     outputTokenCount,
     totalTokenCount,
+
+    reasoningTokenCount:
+      reasoningTokenCount == null
+        ? null
+        : Number(reasoningTokenCount),
   };
 }
 
 /**
- * Send a minimal test request to Revenium.
+ * Report AI usage to Revenium.
  *
- * This is intentionally separate from normal usage reporting.
- * It helps determine whether a 403 is authentication/scope related
- * or whether the normal payload is invalid.
- */
-export async function testRevenium(env) {
-  const apiKey = await getReveniumApiKey(env);
-
-  console.log(
-    "[revenium-test] key resolved:",
-    !!apiKey
-  );
-
-  console.log(
-    "[revenium-test] key prefix:",
-    apiKey ? apiKey.slice(0, 4) : "none"
-  );
-
-  console.log(
-    "[revenium-test] key length:",
-    apiKey?.length ?? 0
-  );
-
-  if (!apiKey) {
-    return {
-      success: false,
-      status: 0,
-      body: "REVENIUM_API_KEY not available",
-    };
-  }
-
-  const now = new Date();
-  const timestamp = now.toISOString();
-
-  const payload = {
-    model: "test-model",
-
-    inputTokenCount: 1,
-    outputTokenCount: 1,
-    totalTokenCount: 2,
-
-    requestTime: timestamp,
-    completionStartTime: timestamp,
-    responseTime: timestamp,
-
-    requestDuration: 1,
-
-    provider: "test",
-    stopReason: "STOP",
-  };
-
-  try {
-    const response = await fetch(
-      REVENIUM_METERING_URL,
-      {
-        method: "POST",
-
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-          "x-api-key": apiKey,
-        },
-
-        body: JSON.stringify(payload),
-      }
-    );
-
-    const body = await response.text();
-
-    console.log(
-      "[revenium-test]",
-      JSON.stringify({
-        status: response.status,
-        statusText: response.statusText,
-        body,
-        endpoint: REVENIUM_METERING_URL,
-      })
-    );
-
-    return {
-      success: response.ok,
-      status: response.status,
-      body,
-    };
-  } catch (err) {
-    console.warn(
-      "[revenium-test] request error:",
-      err?.message || err
-    );
-
-    return {
-      success: false,
-      status: 0,
-      body: err?.message || String(err),
-    };
-  }
-}
-
-/**
- * Report one real AI request to Revenium.
+ * provider and modelSource are optional.
  *
- * Call this using ctx.waitUntil(reportUsage(...))
- * so Revenium never blocks your chat response.
+ * If not supplied:
+ *   -> automatically inferred from model
+ *
+ * If supplied:
+ *   -> explicit values are used
  */
 export async function reportUsage(
   env,
@@ -208,19 +369,22 @@ export async function reportUsage(
     usage,
     operationType = "CHAT",
     requestStartTime,
+
+    // Optional overrides
+    provider,
+    modelSource,
   }
 ) {
   const apiKey = await getReveniumApiKey(env);
 
-  // Safe diagnostics — NEVER log the actual API key.
+  /*
+   * Safe diagnostics.
+   * Never print the actual API key.
+   */
+
   console.log(
     "[revenium] key resolved:",
     !!apiKey
-  );
-
-  console.log(
-    "[revenium] key prefix:",
-    apiKey ? apiKey.slice(0, 4) : "none"
   );
 
   console.log(
@@ -236,13 +400,20 @@ export async function reportUsage(
     return;
   }
 
-  const normalized = normalizeUsage(usage);
+  /*
+   * Normalize token usage.
+   */
 
   const {
     inputTokenCount,
     outputTokenCount,
     totalTokenCount,
-  } = normalized;
+    reasoningTokenCount,
+  } = normalizeUsage(usage);
+
+  /*
+   * Don't send empty usage events.
+   */
 
   if (
     inputTokenCount === 0 &&
@@ -256,28 +427,91 @@ export async function reportUsage(
     return;
   }
 
+  /*
+   * Automatically determine provider/source.
+   */
+
+  const inferred =
+    inferProviderAndSource(model);
+
+  const resolvedProvider =
+    provider || inferred.provider;
+
+  const resolvedModelSource =
+    modelSource || inferred.modelSource;
+
+  /*
+   * Timing.
+   */
+
   const requestTime = requestStartTime
     ? new Date(requestStartTime)
     : new Date();
 
-  const completionStartTime = new Date();
+  const completionStartTime =
+    new Date();
 
-  const responseTime = new Date();
+  const responseTime =
+    new Date();
 
-  const requestDuration = Math.max(
-    1,
-    responseTime.getTime() -
-      requestTime.getTime()
-  );
+  const requestDuration =
+    Math.max(
+      1,
+      responseTime.getTime() -
+        requestTime.getTime()
+    );
+
+  /*
+   * Transaction ID.
+   */
+
+  const transactionId =
+    crypto.randomUUID();
+
+  /*
+   * Revenium payload.
+   *
+   * Organization and product remain unchanged.
+   */
 
   const payload = {
-    model: model || "unknown",
+    transactionId,
 
+    model:
+      model || "unknown",
+
+    /*
+     * Dynamic provider/source.
+     */
+    provider:
+      resolvedProvider,
+
+    modelSource:
+      resolvedModelSource,
+
+    /*
+     * Token counts.
+     */
     inputTokenCount,
+
     outputTokenCount,
+
     totalTokenCount,
 
-    requestTime: requestTime.toISOString(),
+    /*
+     * Optional reasoning tokens.
+     */
+    ...(reasoningTokenCount != null
+      ? {
+          reasoningTokenCount,
+        }
+      : {}),
+
+    /*
+     * Timing.
+     */
+    requestTime:
+      requestTime.toISOString(),
 
     completionStartTime:
       completionStartTime.toISOString(),
@@ -287,72 +521,129 @@ export async function reportUsage(
 
     requestDuration,
 
-    provider: PROVIDER,
+    /*
+     * Completion status.
+     */
+    stopReason:
+      "STOP",
 
-    stopReason: "STOP",
-
-    operationType,
-
+    /*
+     * KEEPING YOUR ORIGINAL VALUES.
+     */
     organizationName:
       ORGANIZATION_NAME,
 
     productName:
       PRODUCT_NAME,
 
-    subscriber: {
-      id: sessionId || "unknown-session",
-    },
+    /*
+     * Existing operation/session information.
+     */
+    operationType,
 
-    transactionId: crypto.randomUUID(),
+    subscriber: {
+      id:
+        sessionId ||
+        "unknown-session",
+    },
   };
 
   try {
-    const response = await fetch(
-      REVENIUM_METERING_URL,
-      {
-        method: "POST",
+    const response =
+      await fetch(
+        REVENIUM_METERING_URL,
+        {
+          method: "POST",
 
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
+          headers: {
+            "Content-Type":
+              "application/json",
 
-          // Revenium authentication
-          "x-api-key": apiKey,
-        },
+            Accept:
+              "application/json",
 
-        body: JSON.stringify(payload),
-      }
-    );
+            "x-api-key":
+              apiKey,
 
-    const body = await response.text();
+            /*
+             * Prevent duplicate
+             * events on retry.
+             */
+            "Idempotency-Key":
+              transactionId,
+          },
+
+          body:
+            JSON.stringify(
+              payload
+            ),
+        }
+      );
+
+    const body =
+      await response.text();
+
+    /*
+     * Failed request.
+     */
 
     if (!response.ok) {
       console.warn(
         "[revenium] metering call failed: " +
           JSON.stringify({
-            status: response.status,
-            statusText: response.statusText,
+            status:
+              response.status,
+
+            statusText:
+              response.statusText,
+
             body,
-            endpoint: REVENIUM_METERING_URL,
-            hasApiKey: !!apiKey,
-            apiKeyPrefix: apiKey.slice(0, 4),
-            apiKeyLength: apiKey.length,
+
+            model,
+
+            provider:
+              resolvedProvider,
+
+            modelSource:
+              resolvedModelSource,
+
+            inputTokenCount,
+
+            outputTokenCount,
+
+            totalTokenCount,
           })
       );
 
       return;
     }
 
+    /*
+     * Successful request.
+     */
+
     console.log(
-      "[revenium] metering call successful:",
-      JSON.stringify({
-        status: response.status,
-        body,
-        model,
-        inputTokenCount,
-        outputTokenCount,
-        totalTokenCount,
-      })
+      "[revenium] metering call successful: " +
+        JSON.stringify({
+          status:
+            response.status,
+
+          model,
+
+          provider:
+            resolvedProvider,
+
+          modelSource:
+            resolvedModelSource,
+
+          inputTokenCount,
+
+          outputTokenCount,
+
+          totalTokenCount,
+
+          transactionId,
+        })
     );
   } catch (err) {
     console.warn(
