@@ -1,67 +1,49 @@
 /**
- * Revenium AI Metering
+ * Revenium AI metering + LiteLLM pricing
  *
  * Flow:
+ *   AI response
+ *      ↓
+ *   normalize token usage
+ *      ↓
+ *   KV pricing cache
+ *      ↓ cache miss
+ *   LiteLLM Model Catalog
+ *      ↓
+ *   calculate input/output/total cost locally
+ *      ↓
+ *   Revenium metering
  *
- * Worker
- *   ↓
- * Token usage
- *   ↓
- * Cloudflare KV pricing cache
- *   ↓
- * Cache miss
- *   ↓
- * Revenium paginated AI Model Catalog
- *   ↓
- * Find exact model
- *   ↓
- * Get inputCostPerToken / outputCostPerToken
- *   ↓
- * Calculate cost locally
- *   ↓
- * POST metering event to Revenium
+ * Required:
+ *   REVENIUM_API_KEY
+ *
+ * Optional:
+ *   REVENIUM_PRICING_CACHE  -> Cloudflare KV binding
+ *
+ * Existing values intentionally preserved:
+ *   Organization: Stellar Global Supplies
+ *   Product: stellar-ai-widget
  */
 
 const REVENIUM_METERING_URL =
   "https://api.revenium.ai/meter/v2/ai/completions";
 
-const REVENIUM_MODELS_URL =
-  "https://api.revenium.ai/profitstream/v2/api/sources/ai/models";
+const LITELLM_CATALOG_URL =
+  "https://api.litellm.ai/model_catalog";
 
-const REVENIUM_TEAM_ID = "5WJ6rl";
+const ORGANIZATION_ID = "Stellar Global Supplies";
+const PRODUCT_ID = "stellar-ai-widget";
 
-const ORGANIZATION_NAME =
-  "Stellar Global Supplies";
-
-const PRODUCT_NAME =
-  "stellar-ai-widget";
-
-/*
- * Pricing cache lifetime:
- * 24 hours
- */
-const PRICING_TTL = 86400;
-
-/*
- * Number of models requested per page.
- */
-const PRICING_PAGE_SIZE = 100;
-
-/*
- * Safety limit so a broken pagination response
- * cannot cause an endless Worker loop.
- */
-const MAX_PRICING_PAGES = 50;
-
+const PRICING_CACHE_TTL = 86400; // 24 hours
+const LITELLM_PAGE_SIZE = 500;
+const MAX_PRICING_PAGES = 10;
 
 /**
- * ---------------------------------------------------------
- * Resolve Revenium API key
- * ---------------------------------------------------------
+ * Resolve Revenium API key.
+ * Supports Cloudflare Secrets Store and normal string secrets.
  */
 async function getReveniumApiKey(env) {
-  const binding =
-    env.REVENIUM_API_KEY;
+  const binding = env.REVENIUM_API_KEY;
 
   if (!binding) {
     return null;
@@ -71,25 +53,15 @@ async function getReveniumApiKey(env) {
     return binding.trim();
   }
 
-  if (
-    typeof binding.get === "function"
-  ) {
+  if (typeof binding.get === "function") {
     try {
-      const value =
-        await binding.get();
-
-      if (!value) {
-        return null;
-      }
-
-      return String(value).trim();
-
+      const value = await binding.get();
+      return value ? String(value).trim() : null;
     } catch (err) {
       console.warn(
         "[revenium] failed to resolve API key:",
         err?.message || err
       );
-
       return null;
     }
   }
@@ -97,838 +69,479 @@ async function getReveniumApiKey(env) {
   return null;
 }
 
-
 /**
- * ---------------------------------------------------------
- * Detect provider and model source dynamically
- * ---------------------------------------------------------
+ * Infer provider + model source.
+ *
+ * Explicit provider/modelSource passed by the caller always wins.
+ *
+ * Examples:
+ *
+ * @cf/meta/llama...       -> Cloudflare / Cloudflare
+ * @cf/deepseek/...        -> Cloudflare / Cloudflare
+ * amazon/...              -> Amazon / Amazon Bedrock
+ * anthropic/...            -> Anthropic / DIRECT
+ * claude-*                -> Anthropic / DIRECT
+ * gpt-*                   -> OpenAI / DIRECT
+ * gemini-*                -> Google / DIRECT
+ * groq/...                -> Groq / Groq
  */
 function inferProviderAndSource(model) {
-  const value =
-    String(model || "").toLowerCase();
+  const value = String(model || "").trim();
+  const lower = value.toLowerCase();
 
-  /*
-   * Cloudflare Workers AI
-   */
-  if (value.startsWith("@cf/")) {
+  // Cloudflare Workers AI
+  if (lower.startsWith("@cf/")) {
     return {
-      provider: "cloudflare",
+      provider: "Cloudflare",
       modelSource: "Cloudflare",
+      litellmProvider: "cloudflare",
     };
   }
 
-  /*
-   * OpenAI
-   */
+  // Groq
+  if (lower.startsWith("groq/") || lower.includes("groq")) {
+    return {
+      provider: "Groq",
+      modelSource: "Groq",
+      litellmProvider: "groq",
+    };
+  }
+
+  // AWS Bedrock
   if (
-    value.includes("gpt-") ||
-    value.includes("o1") ||
-    value.includes("o3") ||
-    value.includes("o4")
+    lower.startsWith("bedrock/") ||
+    lower.startsWith("us.") ||
+    lower.startsWith("eu.") ||
+    lower.startsWith("ap.") ||
+    lower.includes("anthropic.claude") ||
+    lower.includes("amazon.") ||
+    lower.includes("meta.llama") ||
+    lower.includes("mistral.")
+  ) {
+    let provider = "Amazon Bedrock";
+
+    if (lower.includes("anthropic.claude")) {
+      provider = "Anthropic";
+    } else if (lower.includes("amazon.")) {
+      provider = "Amazon";
+    } else if (lower.includes("meta.llama")) {
+      provider = "Meta";
+    } else if (lower.includes("mistral.")) {
+      provider = "Mistral";
+    }
+
+    return {
+      provider,
+      modelSource: "Amazon Bedrock",
+      litellmProvider: "bedrock",
+    };
+  }
+
+  // OpenAI
+  if (
+    lower.includes("gpt-") ||
+    lower.startsWith("openai/") ||
+    lower.startsWith("o1") ||
+    lower.startsWith("o3") ||
+    lower.startsWith("o4")
   ) {
     return {
       provider: "OpenAI",
       modelSource: "DIRECT",
+      litellmProvider: "openai",
     };
   }
 
-  /*
-   * Anthropic
-   */
+  // Anthropic
   if (
-    value.includes("claude") ||
-    value.includes("anthropic")
+    lower.includes("claude") ||
+    lower.startsWith("anthropic/")
   ) {
     return {
       provider: "Anthropic",
       modelSource: "DIRECT",
+      litellmProvider: "anthropic",
     };
   }
 
-  /*
-   * Google
-   */
+  // Google
   if (
-    value.includes("gemini") ||
-    value.includes("gemma")
+    lower.includes("gemini") ||
+    lower.startsWith("google/")
   ) {
     return {
       provider: "Google",
       modelSource: "DIRECT",
+      litellmProvider: "gemini",
     };
   }
 
-  /*
-   * DeepSeek
-   */
+  // Mistral
   if (
-    value.includes("deepseek")
-  ) {
-    return {
-      provider: "DeepSeek",
-      modelSource: "DIRECT",
-    };
-  }
-
-  /*
-   * Mistral
-   */
-  if (
-    value.includes("mistral") ||
-    value.includes("mixtral")
+    lower.includes("mistral") ||
+    lower.includes("mixtral")
   ) {
     return {
       provider: "Mistral",
       modelSource: "DIRECT",
+      litellmProvider: "mistral",
     };
   }
 
-  /*
-   * Groq
-   */
+  // DeepSeek
   if (
-    value.includes("groq") ||
-    value.includes("versatile") ||
-    value.includes("compound")
+    lower.includes("deepseek")
   ) {
     return {
-      provider: "Groq",
+      provider: "DeepSeek",
       modelSource: "DIRECT",
+      litellmProvider: "deepseek",
     };
   }
 
-  /*
-   * Meta / Llama
-   */
+  // Qwen
   if (
-    value.includes("llama")
+    lower.includes("qwen")
   ) {
     return {
-      provider: "Meta",
+      provider: "Qwen",
       modelSource: "DIRECT",
+      litellmProvider: "qwen",
     };
   }
 
   return {
     provider: "Unknown",
     modelSource: "DIRECT",
+    litellmProvider: null,
   };
 }
 
-
 /**
- * ---------------------------------------------------------
- * Normalize token usage
- * ---------------------------------------------------------
+ * Normalize a model name for matching.
  */
-function normalizeUsage(usage) {
-  if (!usage) {
-    return {
-      inputTokenCount: 0,
-      outputTokenCount: 0,
-      totalTokenCount: 0,
-
-      reasoningTokenCount: null,
-
-      cacheCreationTokenCount: null,
-      cacheReadTokenCount: null,
-    };
-  }
-
-  const inputTokenCount =
-    Number(
-      usage.prompt_tokens ??
-      usage.input_tokens ??
-      usage.inputTokenCount ??
-      usage.promptTokens ??
-      0
-    );
-
-  const outputTokenCount =
-    Number(
-      usage.completion_tokens ??
-      usage.output_tokens ??
-      usage.outputTokenCount ??
-      usage.completionTokens ??
-      0
-    );
-
-  const totalTokenCount =
-    Number(
-      usage.total_tokens ??
-      usage.totalTokenCount ??
-      usage.totalTokens ??
-      (
-        inputTokenCount +
-        outputTokenCount
-      )
-    );
-
-  return {
-    inputTokenCount,
-    outputTokenCount,
-    totalTokenCount,
-
-    reasoningTokenCount:
-      usage.reasoning_tokens ??
-      usage.reasoningTokenCount ??
-      null,
-
-    cacheCreationTokenCount:
-      usage.cache_creation_input_tokens ??
-      usage.cacheCreationTokenCount ??
-      null,
-
-    cacheReadTokenCount:
-      usage.cache_read_input_tokens ??
-      usage.cacheReadTokenCount ??
-      null,
-  };
+function normalizeModelName(model) {
+  return String(model || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^cloudflare\//, "")
+    .replace(/^cloudflare-workers-ai\//, "");
 }
 
+/**
+ * Create stable KV cache key.
+ */
+function pricingCacheKey(provider, model) {
+  return `revenium:pricing:${String(provider || "unknown").toLowerCase()}:${normalizeModelName(model)}`;
+}
 
 /**
- * ---------------------------------------------------------
- * Extract model records from different response formats
- * ---------------------------------------------------------
- *
- * Revenium uses a paginated response.
- *
- * Depending on content type / API representation,
- * records may appear under:
- *
- *   content
- *   data
- *   models
- *   _embedded
- *
+ * Find the exact model inside LiteLLM catalog results.
  */
-function extractModelItems(data) {
-  if (Array.isArray(data)) {
-    return data;
+function findExactModel(data, requestedModel) {
+  if (!Array.isArray(data)) {
+    return null;
   }
 
-  if (
-    Array.isArray(data?.content)
-  ) {
-    return data.content;
+  const requested = normalizeModelName(requestedModel);
+
+  // First: exact ID
+  let match = data.find(
+    (item) =>
+      normalizeModelName(item?.id) === requested
+  );
+
+  if (match) {
+    return match;
   }
 
-  if (
-    Array.isArray(data?.data)
-  ) {
-    return data.data;
+  // Second: provider/model combinations
+  match = data.find((item) => {
+    const id = normalizeModelName(item?.id);
+    const modelName = normalizeModelName(item?.model_name);
+    const baseModel = normalizeModelName(item?.base_model);
+
+    return (
+      id === requested ||
+      modelName === requested ||
+      baseModel === requested
+    );
+  });
+
+  if (match) {
+    return match;
   }
 
-  if (
-    Array.isArray(data?.models)
-  ) {
-    return data.models;
-  }
+  // Third: exact suffix match
+  match = data.find((item) => {
+    const id = normalizeModelName(item?.id);
 
-  /*
-   * HAL style response
-   */
-  if (
-    data?._embedded &&
-    typeof data._embedded === "object"
-  ) {
-    const embedded =
-      data._embedded;
+    return (
+      id.endsWith(`/${requested}`) ||
+      requested.endsWith(`/${id}`)
+    );
+  });
 
-    for (
-      const key of Object.keys(embedded)
-    ) {
-      if (
-        Array.isArray(
-          embedded[key]
-        )
-      ) {
-        return embedded[key];
-      }
+  return match || null;
+}
+
+/**
+ * Fetch pricing from LiteLLM.
+ *
+ * Uses:
+ *   provider
+ *   model
+ *   pagination
+ *
+ * The first request normally finds the model immediately.
+ * Pagination is still implemented as a fallback.
+ */
+async function fetchLiteLLMPricing(model, litellmProvider) {
+  const provider = litellmProvider || null;
+
+  for (
+    let page = 1;
+    page <= MAX_PRICING_PAGES;
+    page++
+  ) {
+    const url = new URL(LITELLM_CATALOG_URL);
+
+    if (provider) {
+      url.searchParams.set("provider", provider);
     }
-  }
 
-  return [];
-}
+    // Ask LiteLLM to filter by model.
+    url.searchParams.set("model", model);
 
-
-/**
- * ---------------------------------------------------------
- * Determine pagination state
- * ---------------------------------------------------------
- */
-function getPaginationInfo(
-  data,
-  currentPage,
-  receivedCount
-) {
-  const totalPages =
-    Number(
-      data?.totalPages ??
-      data?.page?.totalPages ??
-      NaN
+    url.searchParams.set(
+      "page",
+      String(page)
     );
 
-  const totalElements =
-    Number(
-      data?.totalElements ??
-      data?.page?.totalElements ??
-      NaN
+    url.searchParams.set(
+      "page_size",
+      String(LITELLM_PAGE_SIZE)
     );
 
-  const pageNumber =
-    Number(
-      data?.number ??
-      data?.page?.number ??
-      currentPage
-    );
-
-  const pageSize =
-    Number(
-      data?.size ??
-      data?.page?.size ??
-      PRICING_PAGE_SIZE
-    );
-
-  /*
-   * Explicit "last" flag.
-   */
-  if (
-    data?.last === true ||
-    data?.page?.last === true
-  ) {
-    return {
-      hasNext: false,
-      totalPages,
-      totalElements,
-    };
-  }
-
-  /*
-   * Explicit total pages.
-   */
-  if (
-    Number.isFinite(totalPages)
-  ) {
-    return {
-      hasNext:
-        currentPage + 1 <
-        totalPages,
-
-      totalPages,
-      totalElements,
-    };
-  }
-
-  /*
-   * HAL next link.
-   */
-  const nextLink =
-    data?._links?.next?.href;
-
-  if (nextLink) {
-    return {
-      hasNext: true,
-      totalPages,
-      totalElements,
-    };
-  }
-
-  /*
-   * If the page returned fewer records
-   * than requested, assume this is the last page.
-   */
-  if (
-    receivedCount <
-    pageSize
-  ) {
-    return {
-      hasNext: false,
-      totalPages,
-      totalElements,
-    };
-  }
-
-  /*
-   * Otherwise continue.
-   */
-  return {
-    hasNext: true,
-    totalPages,
-    totalElements,
-  };
-}
-
-
-/**
- * ---------------------------------------------------------
- * Fetch ONE Revenium model page
- * ---------------------------------------------------------
- */
-async function fetchModelPage(
-  apiKey,
-  model,
-  page
-) {
-  const params =
-    new URLSearchParams();
-
-  params.set(
-    "teamId",
-    REVENIUM_TEAM_ID
-  );
-
-  /*
-   * Search specifically for the model.
-   *
-   * This dramatically reduces the number
-   * of pages we need to inspect.
-   */
-  params.set(
-    "query",
-    model
-  );
-
-  params.set(
-    "page",
-    String(page)
-  );
-
-  params.set(
-    "size",
-    String(PRICING_PAGE_SIZE)
-  );
-
-  const url =
-    `${REVENIUM_MODELS_URL}?${params.toString()}`;
-
-  console.log(
-    "[revenium] model catalog request:",
-    JSON.stringify({
-      page,
-      size:
-        PRICING_PAGE_SIZE,
-      model,
-    })
-  );
-
-  const response =
-    await fetch(
-      url,
-      {
-        method: "GET",
-
-        headers: {
-          Accept:
-            "application/json",
-
-          "x-api-key":
-            apiKey,
-        },
-      }
-    );
-
-  const body =
-    await response.text();
-
-  if (!response.ok) {
-    throw new Error(
-      `Revenium model API ${response.status}: ${body}`
-    );
-  }
-
-  let data;
-
-  try {
-    data =
-      JSON.parse(body);
-
-  } catch {
-    throw new Error(
-      "Revenium model API returned invalid JSON"
-    );
-  }
-
-  return data;
-}
-
-
-/**
- * ---------------------------------------------------------
- * Extract pricing from a model record
- * ---------------------------------------------------------
- */
-function extractModelPricing(item) {
-  if (
-    !item ||
-    typeof item !== "object"
-  ) {
-    return null;
-  }
-
-  /*
-   * Model name
-   */
-  const modelName =
-    item.name ??
-    item.model ??
-    item.modelName ??
-    item.aiModel?.name;
-
-
-  if (!modelName) {
-    return null;
-  }
-
-
-  /*
-   * Revenium model catalog uses
-   *
-   * inputCostPerToken
-   * outputCostPerToken
-   *
-   * These are USD per token.
-   */
-  const inputCostPerToken =
-    Number(
-      item.inputCostPerToken ??
-      item.aiModel?.inputCostPerToken ??
-      NaN
-    );
-
-  const outputCostPerToken =
-    Number(
-      item.outputCostPerToken ??
-      item.aiModel?.outputCostPerToken ??
-      NaN
-    );
-
-
-  if (
-    !Number.isFinite(
-      inputCostPerToken
-    ) ||
-    !Number.isFinite(
-      outputCostPerToken
-    )
-  ) {
-    return null;
-  }
-
-
-  return {
-    model:
-      String(modelName),
-
-    provider:
-      item.provider ??
-      item.aiModel?.provider ??
-      null,
-
-    mode:
-      item.mode ??
-      item.aiModel?.mode ??
-      null,
-
-    inputCostPerToken,
-
-    outputCostPerToken,
-
-    /*
-     * Optional cache pricing
-     */
-    cacheCreationCostPerInputToken:
-      Number(
-        item.cacheCreationCostPerInputToken ??
-        item.aiModel?.cacheCreationCostPerInputToken ??
-        0
-      ),
-
-    cacheReadCostPerInputToken:
-      Number(
-        item.cacheReadCostPerInputToken ??
-        item.aiModel?.cacheReadCostPerInputToken ??
-        0
-      ),
-
-    updatedAt:
-      new Date().toISOString(),
-  };
-}
-
-
-/**
- * ---------------------------------------------------------
- * Find exact model using PAGINATION
- * ---------------------------------------------------------
- */
-async function fetchModelPricingFromRevenium(
-  apiKey,
-  model
-) {
-  let page = 0;
-
-  while (
-    page <
-    MAX_PRICING_PAGES
-  ) {
-    const data =
-      await fetchModelPage(
-        apiKey,
+    console.log(
+      "[pricing] LiteLLM request:",
+      JSON.stringify({
+        provider,
         model,
-        page
-      );
-
-    const items =
-      extractModelItems(
-        data
-      );
-
-
-    console.log(
-      "[revenium] model page:",
-      JSON.stringify({
         page,
-        records:
-          items.length,
+        pageSize: LITELLM_PAGE_SIZE,
       })
     );
 
+    const response = await fetch(url.toString(), {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+      },
+    });
 
-    /*
-     * First look for exact match.
-     */
-    for (
-      const item of items
-    ) {
-      const itemName =
-        String(
-          item.name ??
-          item.model ??
-          item.modelName ??
-          item.aiModel?.name ??
-          ""
-        );
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+
+      throw new Error(
+        `LiteLLM catalog ${response.status}: ${body}`
+      );
+    }
+
+    const result = await response.json();
+
+    const data = Array.isArray(result?.data)
+      ? result.data
+      : [];
+
+    const match = findExactModel(
+      data,
+      model
+    );
+
+    if (match) {
+      const inputCost =
+        Number(match.input_cost_per_token);
+
+      const outputCost =
+        Number(match.output_cost_per_token);
 
       if (
-        itemName === model
+        Number.isFinite(inputCost) &&
+        Number.isFinite(outputCost)
       ) {
-        const pricing =
-          extractModelPricing(
-            item
-          );
+        return {
+          model: match.id || model,
+          provider:
+            match.provider || provider || null,
 
-        if (pricing) {
-          console.log(
-            "[revenium] EXACT MODEL FOUND:",
-            JSON.stringify({
-              model:
-                pricing.model,
+          inputCostPerToken: inputCost,
+          outputCostPerToken: outputCost,
 
-              provider:
-                pricing.provider,
+          cacheReadCostPerToken:
+            Number.isFinite(
+              Number(match.cache_read_input_token_cost)
+            )
+              ? Number(match.cache_read_input_token_cost)
+              : null,
 
-              inputCostPerToken:
-                pricing.inputCostPerToken,
+          cacheCreationCostPerToken:
+            Number.isFinite(
+              Number(match.cache_creation_input_token_cost)
+            )
+              ? Number(match.cache_creation_input_token_cost)
+              : null,
 
-              outputCostPerToken:
-                pricing.outputCostPerToken,
-            })
-          );
-
-          return pricing;
-        }
+          source: "litellm",
+          fetchedAt: new Date().toISOString(),
+        };
       }
     }
 
+    const hasMore = result?.has_more === true;
 
-    /*
-     * Check pagination.
-     */
-    const pagination =
-      getPaginationInfo(
-        data,
-        page,
-        items.length
-      );
-
-
-    console.log(
-      "[revenium] pagination:",
-      JSON.stringify({
-        page,
-        hasNext:
-          pagination.hasNext,
-
-        totalPages:
-          pagination.totalPages,
-
-        totalElements:
-          pagination.totalElements,
-      })
-    );
-
-
-    if (
-      !pagination.hasNext
-    ) {
+    if (!hasMore) {
       break;
     }
-
-
-    page++;
   }
-
-
-  console.warn(
-    "[revenium] exact model not found:",
-    model
-  );
 
   return null;
 }
 
-
 /**
- * ---------------------------------------------------------
- * Get model pricing
+ * Get pricing from KV first.
  *
- * 1. KV
- * 2. Revenium API
- * 3. KV write
- * ---------------------------------------------------------
+ * KV is optional. If KV is not configured, the Worker
+ * simply calls LiteLLM directly.
  */
 async function getModelPricing(
   env,
-  apiKey,
-  model
+  model,
+  litellmProvider
 ) {
-  const cacheKey =
-    `model:${model}`;
+  const cache = env.REVENIUM_PRICING_CACHE;
 
+  const cacheKey = pricingCacheKey(
+    litellmProvider,
+    model
+  );
 
-  /*
-   * -------------------------------------------------------
-   * KV CACHE
-   * -------------------------------------------------------
-   */
-  if (
-    env.AI_PRICING
-  ) {
+  // ------------------------------------------
+  // 1. KV CACHE
+  // ------------------------------------------
+  if (cache) {
     try {
       const cached =
-        await env.AI_PRICING.get(
-          cacheKey,
-          "json"
-        );
-
+        await cache.get(cacheKey, "json");
 
       if (
         cached &&
         Number.isFinite(
-          Number(
-            cached.inputCostPerToken
-          )
+          Number(cached.inputCostPerToken)
         ) &&
         Number.isFinite(
-          Number(
-            cached.outputCostPerToken
-          )
+          Number(cached.outputCostPerToken)
         )
       ) {
         console.log(
-          "[revenium] pricing cache HIT:",
+          "[pricing] cache HIT:",
           model
-        );
-
-        console.log(
-          "[revenium] cached pricing:",
-          JSON.stringify(
-            cached
-          )
         );
 
         return cached;
       }
 
+      console.log(
+        "[pricing] cache MISS:",
+        model
+      );
     } catch (err) {
       console.warn(
-        "[revenium] KV read failed:",
+        "[pricing] KV read failed:",
         err?.message || err
       );
     }
-  }
-
-
-  /*
-   * -------------------------------------------------------
-   * REVENIUM MODEL CATALOG
-   * -------------------------------------------------------
-   */
-  console.log(
-    "[revenium] pricing cache MISS:",
-    model
-  );
-
-
-  const pricing =
-    await fetchModelPricingFromRevenium(
-      apiKey,
-      model
+  } else {
+    console.warn(
+      "[pricing] REVENIUM_PRICING_CACHE not configured — using LiteLLM directly"
     );
-
-
-  if (!pricing) {
-    return null;
   }
 
-
-  /*
-   * -------------------------------------------------------
-   * CACHE
-   * -------------------------------------------------------
-   */
-  if (
-    env.AI_PRICING
-  ) {
-    try {
-      await env.AI_PRICING.put(
-        cacheKey,
-        JSON.stringify(
-          pricing
-        ),
-        {
-          expirationTtl:
-            PRICING_TTL,
-        }
+  // ------------------------------------------
+  // 2. LITELLM
+  // ------------------------------------------
+  try {
+    const pricing =
+      await fetchLiteLLMPricing(
+        model,
+        litellmProvider
       );
 
-
-      console.log(
-        "[revenium] pricing cached:",
+    if (!pricing) {
+      console.warn(
+        "[pricing] LiteLLM pricing not found:",
         model
       );
 
-    } catch (err) {
-      console.warn(
-        "[revenium] KV write failed:",
-        err?.message || err
-      );
+      return null;
     }
+
+    console.log(
+      "[pricing] LiteLLM pricing FOUND:",
+      JSON.stringify({
+        model,
+        provider: litellmProvider,
+        inputCostPerToken:
+          pricing.inputCostPerToken,
+        outputCostPerToken:
+          pricing.outputCostPerToken,
+      })
+    );
+
+    // ------------------------------------------
+    // 3. CACHE FOR 24 HOURS
+    // ------------------------------------------
+    if (cache) {
+      try {
+        await cache.put(
+          cacheKey,
+          JSON.stringify(pricing),
+          {
+            expirationTtl:
+              PRICING_CACHE_TTL,
+          }
+        );
+
+        console.log(
+          "[pricing] cached for 24h:",
+          model
+        );
+      } catch (err) {
+        console.warn(
+          "[pricing] KV write failed:",
+          err?.message || err
+        );
+      }
+    }
+
+    return pricing;
+  } catch (err) {
+    console.warn(
+      "[pricing] LiteLLM lookup FAILED:",
+      err?.message || err
+    );
+
+    return null;
   }
-
-
-  return pricing;
 }
 
-
 /**
- * ---------------------------------------------------------
- * Calculate cost
+ * Calculate AI cost locally.
  *
- * Revenium gives price PER TOKEN.
- * ---------------------------------------------------------
+ * DO NOT round to cents here.
+ *
+ * Revenium accepts decimal USD values and we want
+ * to preserve very small AI costs.
  */
 function calculateCost(
   inputTokenCount,
@@ -939,57 +552,41 @@ function calculateCost(
     return null;
   }
 
+  const inputCost =
+    Number(inputTokenCount || 0) *
+    Number(pricing.inputCostPerToken || 0);
 
-  const inputRate =
-    Number(
-      pricing.inputCostPerToken
-    );
-
-  const outputRate =
-    Number(
-      pricing.outputCostPerToken
-    );
-
-
-  if (
-    !Number.isFinite(
-      inputRate
-    ) ||
-    !Number.isFinite(
-      outputRate
-    )
-  ) {
-    return null;
-  }
-
-
-  const inputTokenCost =
-    Number(inputTokenCount) *
-    inputRate;
-
-
-  const outputTokenCost =
-    Number(outputTokenCount) *
-    outputRate;
-
+  const outputCost =
+    Number(outputTokenCount || 0) *
+    Number(pricing.outputCostPerToken || 0);
 
   const totalCost =
-    inputTokenCost +
-    outputTokenCost;
-
+    inputCost + outputCost;
 
   return {
-    inputTokenCost,
-    outputTokenCost,
+    inputTokenCost: inputCost,
+    outputTokenCost: outputCost,
     totalCost,
   };
 }
 
-
 /**
- * ---------------------------------------------------------
- * Report usage to Revenium
- * ---------------------------------------------------------
+ * Report one AI call to Revenium.
+ *
+ * Existing callers continue to work:
+ *
+ * reportUsage(env, {
+ *   model,
+ *   sessionId,
+ *   usage,
+ *   operationType,
+ *   requestStartTime
+ * })
+ *
+ * Optional:
+ *
+ * provider
+ * modelSource
  */
 export async function reportUsage(
   env,
@@ -997,81 +594,35 @@ export async function reportUsage(
     model,
     sessionId,
     usage,
-
     operationType = "CHAT",
-
     requestStartTime,
 
+    // Optional explicit values.
     provider,
     modelSource,
   }
 ) {
-
-  /*
-   * -------------------------------------------------------
-   * API KEY
-   * -------------------------------------------------------
-   */
   const apiKey =
-    await getReveniumApiKey(
-      env
-    );
-
-
-  console.log(
-    "[revenium] key resolved:",
-    !!apiKey
-  );
-
-
-  console.log(
-    "[revenium] key length:",
-    apiKey?.length ?? 0
-  );
-
+    await getReveniumApiKey(env);
 
   if (!apiKey) {
     console.warn(
-      "[revenium] REVENIUM_API_KEY not available"
+      "[revenium] REVENIUM_API_KEY not available — skipping usage report"
     );
-
     return;
   }
 
-
-  /*
-   * -------------------------------------------------------
-   * TOKEN USAGE
-   * -------------------------------------------------------
-   */
+  // ------------------------------------------
+  // TOKEN USAGE
+  // ------------------------------------------
   const {
     inputTokenCount,
     outputTokenCount,
     totalTokenCount,
-
     reasoningTokenCount,
-
     cacheCreationTokenCount,
     cacheReadTokenCount,
-
-  } = normalizeUsage(
-    usage
-  );
-
-
-  console.log(
-    "[revenium] TOKEN USAGE:",
-    JSON.stringify({
-      model,
-
-      inputTokenCount,
-
-      outputTokenCount,
-
-      totalTokenCount,
-    })
-  );
-
+  } = normalizeUsage(usage);
 
   if (
     inputTokenCount === 0 &&
@@ -1079,191 +630,106 @@ export async function reportUsage(
     totalTokenCount === 0
   ) {
     console.warn(
-      "[revenium] no token usage found"
+      "[revenium] no token usage found — skipping usage report"
     );
-
     return;
   }
 
-
-  /*
-   * -------------------------------------------------------
-   * PROVIDER
-   * -------------------------------------------------------
-   */
+  // ------------------------------------------
+  // PROVIDER + MODEL SOURCE
+  // ------------------------------------------
   const inferred =
-    inferProviderAndSource(
-      model
-    );
-
+    inferProviderAndSource(model);
 
   const resolvedProvider =
-    provider ||
-    inferred.provider;
-
+    provider || inferred.provider;
 
   const resolvedModelSource =
-    modelSource ||
-    inferred.modelSource;
+    modelSource || inferred.modelSource;
 
+  const litellmProvider =
+    inferred.litellmProvider;
 
-  /*
-   * -------------------------------------------------------
-   * PRICING
-   * -------------------------------------------------------
-   */
-  let pricing =
-    null;
-
-
-  try {
-    pricing =
-      await getModelPricing(
-        env,
-        apiKey,
-        model
-      );
-
-  } catch (err) {
-
-    console.warn(
-      "[revenium] pricing lookup FAILED:",
-      err?.message || err
+  // ------------------------------------------
+  // PRICING
+  // ------------------------------------------
+  const pricing =
+    await getModelPricing(
+      env,
+      model,
+      litellmProvider
     );
-  }
 
-
-  /*
-   * -------------------------------------------------------
-   * CALCULATE COST
-   * -------------------------------------------------------
-   */
-  const calculatedCost =
+  const cost =
     calculateCost(
       inputTokenCount,
       outputTokenCount,
       pricing
     );
 
-
-  /*
-   * -------------------------------------------------------
-   * DEBUG PRICING
-   * -------------------------------------------------------
-   */
-  console.log(
-    "[revenium] FINAL PRICING:",
-    JSON.stringify(
-      pricing
-    )
-  );
-
-
-  /*
-   * -------------------------------------------------------
-   * DEBUG COST
-   * -------------------------------------------------------
-   */
-  console.log(
-    "[revenium] FINAL COST:",
-    JSON.stringify(
-      calculatedCost
-    )
-  );
-
-
-  if (
-    calculatedCost
-  ) {
-
+  if (cost) {
     console.log(
-      "[revenium] COST VALUES:",
+      "[pricing] CALCULATED COST:",
       JSON.stringify({
+        model,
+        provider: resolvedProvider,
+        modelSource: resolvedModelSource,
+
+        inputTokenCount,
+        outputTokenCount,
+
+        inputCostPerToken:
+          pricing.inputCostPerToken,
+
+        outputCostPerToken:
+          pricing.outputCostPerToken,
+
         inputTokenCost:
-          calculatedCost.inputTokenCost,
+          cost.inputTokenCost,
 
         outputTokenCost:
-          calculatedCost.outputTokenCost,
+          cost.outputTokenCost,
 
         totalCost:
-          calculatedCost.totalCost,
-
-        inputTokenCostFixed:
-          calculatedCost.inputTokenCost.toFixed(
-            12
-          ),
-
-        outputTokenCostFixed:
-          calculatedCost.outputTokenCost.toFixed(
-            12
-          ),
-
-        totalCostFixed:
-          calculatedCost.totalCost.toFixed(
-            12
-          ),
+          cost.totalCost,
       })
     );
-
   } else {
-
     console.warn(
-      "[revenium] cost could not be calculated:",
+      "[pricing] cost could not be calculated:",
       model
     );
-
   }
 
+  // ------------------------------------------
+  // TIMING
+  // ------------------------------------------
+  const now = new Date();
 
-  /*
-   * -------------------------------------------------------
-   * TIMING
-   * -------------------------------------------------------
-   */
   const requestTime =
     requestStartTime
-      ? new Date(
-          requestStartTime
-        )
-      : new Date();
+      ? new Date(requestStartTime)
+      : now;
 
-
-  const completionStartTime =
-    new Date();
-
-
-  const responseTime =
-    new Date();
-
+  const responseTime = now;
 
   const requestDuration =
     Math.max(
       1,
       responseTime.getTime() -
-      requestTime.getTime()
+        requestTime.getTime()
     );
 
-
-  /*
-   * -------------------------------------------------------
-   * TRANSACTION ID
-   * -------------------------------------------------------
-   */
   const transactionId =
     crypto.randomUUID();
 
-
-  /*
-   * -------------------------------------------------------
-   * PAYLOAD
-   * -------------------------------------------------------
-   */
+  // ------------------------------------------
+  // REVENIUM PAYLOAD
+  // ------------------------------------------
   const payload = {
     transactionId,
 
-    model:
-      model ||
-      "unknown",
+    model: model || "unknown",
 
     provider:
       resolvedProvider,
@@ -1271,112 +737,69 @@ export async function reportUsage(
     modelSource:
       resolvedModelSource,
 
-
-    /*
-     * Tokens
-     */
     inputTokenCount,
 
     outputTokenCount,
 
     totalTokenCount,
 
-
-    /*
-     * Calculated costs
-     */
-    ...(calculatedCost
-      ? {
-
-          inputTokenCost:
-            calculatedCost.inputTokenCost,
-
-          outputTokenCost:
-            calculatedCost.outputTokenCost,
-
-          totalCost:
-            calculatedCost.totalCost,
-
-        }
-      : {}),
-
-
-    /*
-     * Reasoning
-     */
     ...(reasoningTokenCount != null
       ? {
-          reasoningTokenCount:
-            Number(
-              reasoningTokenCount
-            ),
+          reasoningTokenCount,
         }
       : {}),
 
-
-    /*
-     * Cache creation
-     */
     ...(cacheCreationTokenCount != null
       ? {
-          cacheCreationTokenCount:
-            Number(
-              cacheCreationTokenCount
-            ),
+          cacheCreationTokenCount,
         }
       : {}),
 
-
-    /*
-     * Cache read
-     */
     ...(cacheReadTokenCount != null
       ? {
-          cacheReadTokenCount:
-            Number(
-              cacheReadTokenCount
-            ),
+          cacheReadTokenCount,
         }
       : {}),
 
+    // ----------------------------------------
+    // OUR CALCULATED COST
+    // ----------------------------------------
+    ...(cost
+      ? {
+          inputTokenCost:
+            cost.inputTokenCost,
 
-    /*
-     * Timing
-     */
+          outputTokenCost:
+            cost.outputTokenCost,
+
+          totalCost:
+            cost.totalCost,
+
+          costType: "AI",
+        }
+      : {}),
+
     requestTime:
       requestTime.toISOString(),
 
     completionStartTime:
-      completionStartTime.toISOString(),
+      responseTime.toISOString(),
 
     responseTime:
       responseTime.toISOString(),
 
     requestDuration,
 
+    stopReason: "STOP",
 
-    /*
-     * Status
-     */
-    stopReason:
-      "STOP",
-
-
-    /*
-     * Existing organization/product
-     */
     organizationName:
-      ORGANIZATION_NAME,
+      ORGANIZATION_ID,
 
     productName:
-      PRODUCT_NAME,
+      PRODUCT_ID,
 
     operationType,
 
-
-    /*
-     * Subscriber
-     */
     subscriber: {
       id:
         sessionId ||
@@ -1384,23 +807,12 @@ export async function reportUsage(
     },
   };
 
-
-  /*
-   * -------------------------------------------------------
-   * FINAL PAYLOAD DEBUG
-   * -------------------------------------------------------
-   */
   console.log(
     "[revenium] FINAL COST PAYLOAD:",
     JSON.stringify({
-      model:
-        payload.model,
-
-      provider:
-        payload.provider,
-
-      modelSource:
-        payload.modelSource,
+      model: payload.model,
+      provider: payload.provider,
+      modelSource: payload.modelSource,
 
       inputTokenCount:
         payload.inputTokenCount,
@@ -1412,30 +824,25 @@ export async function reportUsage(
         payload.totalTokenCount,
 
       inputTokenCost:
-        payload.inputTokenCost,
+        payload.inputTokenCost ?? null,
 
       outputTokenCost:
-        payload.outputTokenCost,
+        payload.outputTokenCost ?? null,
 
       totalCost:
-        payload.totalCost,
+        payload.totalCost ?? null,
     })
   );
 
-
-  /*
-   * -------------------------------------------------------
-   * SEND METERING EVENT
-   * -------------------------------------------------------
-   */
+  // ------------------------------------------
+  // REVENIUM METERING
+  // ------------------------------------------
   try {
-
     const response =
       await fetch(
         REVENIUM_METERING_URL,
         {
-          method:
-            "POST",
+          method: "POST",
 
           headers: {
             "Content-Type":
@@ -1452,24 +859,14 @@ export async function reportUsage(
           },
 
           body:
-            JSON.stringify(
-              payload
-            ),
+            JSON.stringify(payload),
         }
       );
-
 
     const body =
       await response.text();
 
-
-    /*
-     * FAILED
-     */
-    if (
-      !response.ok
-    ) {
-
+    if (!response.ok) {
       console.warn(
         "[revenium] metering call FAILED:",
         JSON.stringify({
@@ -1481,80 +878,149 @@ export async function reportUsage(
 
           body,
 
-          model,
+          model:
+            payload.model,
 
           provider:
-            resolvedProvider,
+            payload.provider,
 
           modelSource:
-            resolvedModelSource,
+            payload.modelSource,
 
-          inputTokenCount,
+          inputTokenCount:
+            payload.inputTokenCount,
 
-          outputTokenCount,
+          outputTokenCount:
+            payload.outputTokenCount,
 
-          totalTokenCount,
-
-          inputTokenCost:
-            calculatedCost?.inputTokenCost,
-
-          outputTokenCost:
-            calculatedCost?.outputTokenCost,
+          totalTokenCount:
+            payload.totalTokenCount,
 
           totalCost:
-            calculatedCost?.totalCost,
+            payload.totalCost ?? null,
         })
       );
 
       return;
     }
 
-
-    /*
-     * SUCCESS
-     */
     console.log(
       "[revenium] metering call SUCCESS:",
       JSON.stringify({
         status:
           response.status,
 
-        body,
-
-        model,
+        model:
+          payload.model,
 
         provider:
-          resolvedProvider,
+          payload.provider,
 
         modelSource:
-          resolvedModelSource,
+          payload.modelSource,
 
-        inputTokenCount,
+        inputTokenCount:
+          payload.inputTokenCount,
 
-        outputTokenCount,
+        outputTokenCount:
+          payload.outputTokenCount,
 
-        totalTokenCount,
+        totalTokenCount:
+          payload.totalTokenCount,
 
         inputTokenCost:
-          calculatedCost?.inputTokenCost,
+          payload.inputTokenCost ?? null,
 
         outputTokenCost:
-          calculatedCost?.outputTokenCost,
+          payload.outputTokenCost ?? null,
 
         totalCost:
-          calculatedCost?.totalCost,
+          payload.totalCost ?? null,
 
         transactionId,
       })
     );
-
-
   } catch (err) {
-
+    // Never allow Revenium/LiteLLM/KV issues
+    // to break the actual AI request.
     console.warn(
-      "[revenium] metering call ERROR:",
+      "[revenium] metering call errored:",
       err?.message || err
     );
-
   }
+}
+
+/**
+ * Normalize Workers AI / provider usage.
+ */
+function normalizeUsage(usage) {
+  if (!usage) {
+    return {
+      inputTokenCount: 0,
+      outputTokenCount: 0,
+      totalTokenCount: 0,
+      reasoningTokenCount: null,
+      cacheCreationTokenCount: null,
+      cacheReadTokenCount: null,
+    };
+  }
+
+  const inputTokenCount =
+    Number(
+      usage.prompt_tokens ??
+        usage.input_tokens ??
+        usage.inputTokenCount ??
+        0
+    );
+
+  const outputTokenCount =
+    Number(
+      usage.completion_tokens ??
+        usage.output_tokens ??
+        usage.outputTokenCount ??
+        0
+    );
+
+  const totalTokenCount =
+    Number(
+      usage.total_tokens ??
+        usage.totalTokenCount ??
+        (inputTokenCount +
+          outputTokenCount)
+    );
+
+  const reasoningTokenCount =
+    usage.reasoning_tokens ??
+    usage.reasoningTokenCount ??
+    null;
+
+  const cacheCreationTokenCount =
+    usage.cache_creation_input_tokens ??
+    usage.cacheCreationTokenCount ??
+    null;
+
+  const cacheReadTokenCount =
+    usage.cache_read_input_tokens ??
+    usage.cacheReadTokenCount ??
+    null;
+
+  return {
+    inputTokenCount,
+    outputTokenCount,
+    totalTokenCount,
+    reasoningTokenCount:
+      reasoningTokenCount != null
+        ? Number(reasoningTokenCount)
+        : null,
+
+    cacheCreationTokenCount:
+      cacheCreationTokenCount != null
+        ? Number(cacheCreationTokenCount)
+        : null,
+
+    cacheReadTokenCount:
+      cacheReadTokenCount != null
+        ? Number(cacheReadTokenCount)
+        : null,
+  };
 }
