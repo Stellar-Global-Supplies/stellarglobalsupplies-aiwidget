@@ -1,11 +1,18 @@
 /**
- * Revenium AI metering
+ * Revenium AI Metering
  *
  * Flow:
- * 1. Get model pricing from Revenium
- * 2. Cache pricing in Cloudflare KV
- * 3. Calculate cost locally
- * 4. Send tokens + calculated cost to Revenium
+ * Worker
+ *   ↓
+ * Get token usage
+ *   ↓
+ * Get model pricing from Revenium
+ *   ↓
+ * Cache pricing in KV
+ *   ↓
+ * Calculate cost locally
+ *   ↓
+ * Send tokens + calculated cost to Revenium
  */
 
 const REVENIUM_METERING_URL =
@@ -23,7 +30,7 @@ const PRICING_TTL = 86400;
 
 
 /**
- * Resolve Revenium API key.
+ * Get Revenium API key
  */
 async function getReveniumApiKey(env) {
   const binding = env.REVENIUM_API_KEY;
@@ -60,14 +67,11 @@ async function getReveniumApiKey(env) {
 
 
 /**
- * Detect provider and model source.
+ * Detect provider + model source dynamically
  */
 function inferProviderAndSource(model) {
   const value = String(model || "").toLowerCase();
 
-  /*
-   * Cloudflare Workers AI
-   */
   if (value.startsWith("@cf/")) {
     return {
       provider: "cloudflare",
@@ -75,9 +79,6 @@ function inferProviderAndSource(model) {
     };
   }
 
-  /*
-   * OpenAI
-   */
   if (
     value.includes("gpt-") ||
     value.includes("o1") ||
@@ -90,9 +91,6 @@ function inferProviderAndSource(model) {
     };
   }
 
-  /*
-   * Anthropic
-   */
   if (
     value.includes("claude") ||
     value.includes("anthropic")
@@ -103,9 +101,6 @@ function inferProviderAndSource(model) {
     };
   }
 
-  /*
-   * Google
-   */
   if (
     value.includes("gemini") ||
     value.includes("gemma")
@@ -116,9 +111,6 @@ function inferProviderAndSource(model) {
     };
   }
 
-  /*
-   * DeepSeek
-   */
   if (value.includes("deepseek")) {
     return {
       provider: "DeepSeek",
@@ -126,9 +118,6 @@ function inferProviderAndSource(model) {
     };
   }
 
-  /*
-   * Mistral
-   */
   if (
     value.includes("mistral") ||
     value.includes("mixtral")
@@ -139,9 +128,6 @@ function inferProviderAndSource(model) {
     };
   }
 
-  /*
-   * Groq
-   */
   if (
     value.includes("groq") ||
     value.includes("versatile") ||
@@ -153,9 +139,6 @@ function inferProviderAndSource(model) {
     };
   }
 
-  /*
-   * Meta / Llama
-   */
   if (value.includes("llama")) {
     return {
       provider: "Meta",
@@ -171,7 +154,7 @@ function inferProviderAndSource(model) {
 
 
 /**
- * Normalize token usage.
+ * Normalize token usage
  */
 function normalizeUsage(usage) {
   if (!usage) {
@@ -187,25 +170,25 @@ function normalizeUsage(usage) {
 
   const inputTokenCount = Number(
     usage.prompt_tokens ??
-      usage.input_tokens ??
-      usage.inputTokenCount ??
-      usage.promptTokens ??
-      0
+    usage.input_tokens ??
+    usage.inputTokenCount ??
+    usage.promptTokens ??
+    0
   );
 
   const outputTokenCount = Number(
     usage.completion_tokens ??
-      usage.output_tokens ??
-      usage.outputTokenCount ??
-      usage.completionTokens ??
-      0
+    usage.output_tokens ??
+    usage.outputTokenCount ??
+    usage.completionTokens ??
+    0
   );
 
   const totalTokenCount = Number(
     usage.total_tokens ??
-      usage.totalTokenCount ??
-      usage.totalTokens ??
-      inputTokenCount + outputTokenCount
+    usage.totalTokenCount ??
+    usage.totalTokens ??
+    inputTokenCount + outputTokenCount
   );
 
   return {
@@ -232,7 +215,7 @@ function normalizeUsage(usage) {
 
 
 /**
- * Normalize Revenium pricing response.
+ * Normalize Revenium pricing response
  */
 function normalizeRate(item) {
   if (!item || typeof item !== "object") {
@@ -245,27 +228,25 @@ function normalizeRate(item) {
     item.modelName ??
     item.aiModel?.name;
 
-  const inputPerMillion =
-    Number(
-      item.inputCostPerMillionTokens ??
-      item.inputCostPer1M ??
-      item.inputRatePerMillionTokens ??
-      item.inputPricePerMillionTokens ??
-      item.inputCostPerMillion ??
-      item.inputCost ??
-      0
-    );
+  const inputPerMillion = Number(
+    item.inputCostPerMillionTokens ??
+    item.inputCostPer1M ??
+    item.inputRatePerMillionTokens ??
+    item.inputPricePerMillionTokens ??
+    item.inputCostPerMillion ??
+    item.inputCost ??
+    0
+  );
 
-  const outputPerMillion =
-    Number(
-      item.outputCostPerMillionTokens ??
-      item.outputCostPer1M ??
-      item.outputRatePerMillionTokens ??
-      item.outputPricePerMillionTokens ??
-      item.outputCostPerMillion ??
-      item.outputCost ??
-      0
-    );
+  const outputPerMillion = Number(
+    item.outputCostPerMillionTokens ??
+    item.outputCostPer1M ??
+    item.outputRatePerMillionTokens ??
+    item.outputPricePerMillionTokens ??
+    item.outputCostPerMillion ??
+    item.outputCost ??
+    0
+  );
 
   if (!model) {
     return null;
@@ -284,28 +265,27 @@ function normalizeRate(item) {
 
 
 /**
- * Fetch model pricing from Revenium.
+ * Fetch pricing from Revenium
  */
 async function fetchReveniumRates(apiKey) {
   const url =
     `${REVENIUM_RATES_URL}?teamId=${encodeURIComponent(REVENIUM_TEAM_ID)}`;
 
   console.log(
-    "[revenium] fetching model pricing"
+    "[revenium] fetching pricing:",
+    url
   );
 
-  const response =
-    await fetch(url, {
-      method: "GET",
+  const response = await fetch(url, {
+    method: "GET",
 
-      headers: {
-        Accept: "application/json",
-        "x-api-key": apiKey,
-      },
-    });
+    headers: {
+      Accept: "application/json",
+      "x-api-key": apiKey,
+    },
+  });
 
-  const body =
-    await response.text();
+  const body = await response.text();
 
   if (!response.ok) {
     throw new Error(
@@ -328,7 +308,7 @@ async function fetchReveniumRates(apiKey) {
 
 
 /**
- * Convert pricing response into a model map.
+ * Build pricing map
  */
 function buildPricingMap(data) {
   const map = {};
@@ -347,9 +327,13 @@ function buildPricingMap(data) {
     items = data.rates;
   }
 
+  console.log(
+    "[revenium] pricing records received:",
+    items.length
+  );
+
   for (const item of items) {
-    const rate =
-      normalizeRate(item);
+    const rate = normalizeRate(item);
 
     if (!rate) {
       continue;
@@ -372,26 +356,21 @@ function buildPricingMap(data) {
 
 
 /**
- * Get model pricing.
+ * Get pricing
  *
- * 1. Try KV
- * 2. If missing, query Revenium
- * 3. Cache the model price
+ * KV first
+ * Revenium second
  */
 async function getModelPricing(
   env,
   apiKey,
   model
 ) {
-  const cacheKey =
-    `model:${model}`;
+  const cacheKey = `model:${model}`;
 
-  /*
-   * ----------------------------------------
-   * KV lookup
-   * ----------------------------------------
+  /**
+   * KV
    */
-
   if (env.AI_PRICING) {
     try {
       const cached =
@@ -403,15 +382,20 @@ async function getModelPricing(
       if (
         cached &&
         Number.isFinite(
-          cached.inputCostPerMillion
+          Number(cached.inputCostPerMillion)
         ) &&
         Number.isFinite(
-          cached.outputCostPerMillion
+          Number(cached.outputCostPerMillion)
         )
       ) {
         console.log(
-          "[revenium] pricing cache hit:",
+          "[revenium] pricing cache HIT:",
           model
+        );
+
+        console.log(
+          "[revenium] cached pricing:",
+          JSON.stringify(cached)
         );
 
         return cached;
@@ -425,14 +409,11 @@ async function getModelPricing(
   }
 
 
-  /*
-   * ----------------------------------------
-   * Revenium pricing API
-   * ----------------------------------------
+  /**
+   * Revenium
    */
-
   console.log(
-    "[revenium] pricing cache miss:",
+    "[revenium] pricing cache MISS:",
     model
   );
 
@@ -448,20 +429,34 @@ async function getModelPricing(
 
   if (!pricing) {
     console.warn(
-      "[revenium] model pricing not found:",
+      "[revenium] MODEL PRICING NOT FOUND:",
       model
+    );
+
+    console.log(
+      "[revenium] available pricing models:",
+      Object.keys(pricingMap).slice(0, 30)
     );
 
     return null;
   }
 
 
-  /*
-   * ----------------------------------------
-   * Cache pricing
-   * ----------------------------------------
-   */
+  console.log(
+    "[revenium] pricing FOUND:",
+    JSON.stringify({
+      model,
+      inputCostPerMillion:
+        pricing.inputCostPerMillion,
+      outputCostPerMillion:
+        pricing.outputCostPerMillion,
+    })
+  );
 
+
+  /**
+   * KV cache
+   */
   if (env.AI_PRICING) {
     try {
       await env.AI_PRICING.put(
@@ -477,7 +472,6 @@ async function getModelPricing(
         "[revenium] pricing cached:",
         model
       );
-
     } catch (err) {
       console.warn(
         "[revenium] KV write failed:",
@@ -486,16 +480,14 @@ async function getModelPricing(
     }
   }
 
-
   return pricing;
 }
 
 
 /**
- * Calculate cost locally.
+ * Calculate cost locally
  *
- * Rates are assumed to be USD
- * per 1 million tokens.
+ * Pricing is USD per 1M tokens
  */
 function calculateCost(
   inputTokenCount,
@@ -506,21 +498,35 @@ function calculateCost(
     return null;
   }
 
+  const inputRate =
+    Number(
+      pricing.inputCostPerMillion
+    );
+
+  const outputRate =
+    Number(
+      pricing.outputCostPerMillion
+    );
+
+
   const inputTokenCost =
     (
-      inputTokenCount *
-      pricing.inputCostPerMillion
+      Number(inputTokenCount) *
+      inputRate
     ) / 1000000;
+
 
   const outputTokenCost =
     (
-      outputTokenCount *
-      pricing.outputCostPerMillion
+      Number(outputTokenCount) *
+      outputRate
     ) / 1000000;
+
 
   const totalCost =
     inputTokenCost +
     outputTokenCost;
+
 
   return {
     inputTokenCost,
@@ -531,7 +537,7 @@ function calculateCost(
 
 
 /**
- * Report usage to Revenium.
+ * Report usage to Revenium
  */
 export async function reportUsage(
   env,
@@ -548,12 +554,10 @@ export async function reportUsage(
     modelSource,
   }
 ) {
-  /*
-   * ----------------------------------------
-   * API key
-   * ----------------------------------------
-   */
 
+  /**
+   * API key
+   */
   const apiKey =
     await getReveniumApiKey(env);
 
@@ -578,12 +582,9 @@ export async function reportUsage(
   }
 
 
-  /*
-   * ----------------------------------------
-   * Token usage
-   * ----------------------------------------
+  /**
+   * Tokens
    */
-
   const {
     inputTokenCount,
     outputTokenCount,
@@ -595,6 +596,17 @@ export async function reportUsage(
     cacheReadTokenCount,
 
   } = normalizeUsage(usage);
+
+
+  console.log(
+    "[revenium] TOKEN USAGE:",
+    JSON.stringify({
+      model,
+      inputTokenCount,
+      outputTokenCount,
+      totalTokenCount,
+    })
+  );
 
 
   if (
@@ -610,12 +622,9 @@ export async function reportUsage(
   }
 
 
-  /*
-   * ----------------------------------------
+  /**
    * Provider
-   * ----------------------------------------
    */
-
   const inferred =
     inferProviderAndSource(model);
 
@@ -628,12 +637,9 @@ export async function reportUsage(
     inferred.modelSource;
 
 
-  /*
-   * ----------------------------------------
+  /**
    * Pricing
-   * ----------------------------------------
    */
-
   let pricing = null;
 
   try {
@@ -645,18 +651,15 @@ export async function reportUsage(
       );
   } catch (err) {
     console.warn(
-      "[revenium] pricing lookup failed:",
+      "[revenium] pricing lookup FAILED:",
       err?.message || err
     );
   }
 
 
-  /*
-   * ----------------------------------------
-   * Calculate cost
-   * ----------------------------------------
+  /**
+   * Local cost calculation
    */
-
   const calculatedCost =
     calculateCost(
       inputTokenCount,
@@ -665,15 +668,32 @@ export async function reportUsage(
     );
 
 
+  /**
+   * IMPORTANT DEBUG LOG
+   *
+   * This tells us exactly what Worker calculated.
+   */
+  console.log(
+    "[revenium] FINAL PRICING:",
+    JSON.stringify(
+      pricing
+    )
+  );
+
+
+  console.log(
+    "[revenium] FINAL COST:",
+    JSON.stringify(
+      calculatedCost
+    )
+  );
+
+
   if (calculatedCost) {
+
     console.log(
-      "[revenium] calculated cost:",
+      "[revenium] COST VALUES:",
       JSON.stringify({
-        model,
-
-        inputTokenCount,
-        outputTokenCount,
-
         inputTokenCost:
           calculatedCost.inputTokenCost,
 
@@ -682,22 +702,30 @@ export async function reportUsage(
 
         totalCost:
           calculatedCost.totalCost,
+
+        inputTokenCostFixed:
+          calculatedCost.inputTokenCost.toFixed(12),
+
+        outputTokenCostFixed:
+          calculatedCost.outputTokenCost.toFixed(12),
+
+        totalCostFixed:
+          calculatedCost.totalCost.toFixed(12),
       })
     );
+
   } else {
+
     console.warn(
-      "[revenium] cost could not be calculated:",
-      model
+      "[revenium] COST NOT CALCULATED"
     );
+
   }
 
 
-  /*
-   * ----------------------------------------
+  /**
    * Timing
-   * ----------------------------------------
    */
-
   const requestTime =
     requestStartTime
       ? new Date(requestStartTime)
@@ -713,26 +741,20 @@ export async function reportUsage(
     Math.max(
       1,
       responseTime.getTime() -
-        requestTime.getTime()
+      requestTime.getTime()
     );
 
 
-  /*
-   * ----------------------------------------
+  /**
    * Transaction ID
-   * ----------------------------------------
    */
-
   const transactionId =
     crypto.randomUUID();
 
 
-  /*
-   * ----------------------------------------
-   * Metering payload
-   * ----------------------------------------
+  /**
+   * Payload
    */
-
   const payload = {
     transactionId,
 
@@ -752,10 +774,9 @@ export async function reportUsage(
     totalTokenCount,
 
 
-    /*
-     * Our calculated costs.
+    /**
+     * Explicit cost values
      */
-
     ...(calculatedCost
       ? {
           inputTokenCost:
@@ -770,10 +791,9 @@ export async function reportUsage(
       : {}),
 
 
-    /*
-     * Optional reasoning tokens.
+    /**
+     * Reasoning tokens
      */
-
     ...(reasoningTokenCount != null
       ? {
           reasoningTokenCount:
@@ -784,10 +804,9 @@ export async function reportUsage(
       : {}),
 
 
-    /*
-     * Optional cache tokens.
+    /**
+     * Cache tokens
      */
-
     ...(cacheCreationTokenCount != null
       ? {
           cacheCreationTokenCount:
@@ -796,6 +815,7 @@ export async function reportUsage(
             ),
         }
       : {}),
+
 
     ...(cacheReadTokenCount != null
       ? {
@@ -807,10 +827,9 @@ export async function reportUsage(
       : {}),
 
 
-    /*
-     * Timing.
+    /**
+     * Timing
      */
-
     requestTime:
       requestTime.toISOString(),
 
@@ -823,18 +842,16 @@ export async function reportUsage(
     requestDuration,
 
 
-    /*
-     * Completion status.
+    /**
+     * Status
      */
-
     stopReason:
       "STOP",
 
 
-    /*
-     * Existing values.
+    /**
+     * Existing values
      */
-
     organizationName:
       ORGANIZATION_NAME,
 
@@ -851,13 +868,42 @@ export async function reportUsage(
   };
 
 
-  /*
-   * ----------------------------------------
-   * Send metering event
-   * ----------------------------------------
+  /**
+   * DEBUG:
+   * Show exactly what is being sent.
    */
+  console.log(
+    "[revenium] FINAL COST PAYLOAD:",
+    JSON.stringify({
+      model:
+        payload.model,
 
+      inputTokenCount:
+        payload.inputTokenCount,
+
+      outputTokenCount:
+        payload.outputTokenCount,
+
+      totalTokenCount:
+        payload.totalTokenCount,
+
+      inputTokenCost:
+        payload.inputTokenCost,
+
+      outputTokenCost:
+        payload.outputTokenCost,
+
+      totalCost:
+        payload.totalCost,
+    })
+  );
+
+
+  /**
+   * Metering request
+   */
   try {
+
     const response =
       await fetch(
         REVENIUM_METERING_URL,
@@ -891,44 +937,17 @@ export async function reportUsage(
 
 
     if (!response.ok) {
+
       console.warn(
-        "[revenium] metering call failed: " +
-          JSON.stringify({
-            status:
-              response.status,
-
-            statusText:
-              response.statusText,
-
-            body,
-
-            model,
-
-            provider:
-              resolvedProvider,
-
-            modelSource:
-              resolvedModelSource,
-
-            inputTokenCount,
-
-            outputTokenCount,
-
-            totalTokenCount,
-
-            calculatedCost,
-          })
-      );
-
-      return;
-    }
-
-
-    console.log(
-      "[revenium] metering call successful: " +
+        "[revenium] metering call FAILED:",
         JSON.stringify({
           status:
             response.status,
+
+          statusText:
+            response.statusText,
+
+          body,
 
           model,
 
@@ -944,16 +963,65 @@ export async function reportUsage(
 
           totalTokenCount,
 
-          calculatedCost,
+          inputTokenCost:
+            calculatedCost?.inputTokenCost,
 
-          transactionId,
+          outputTokenCost:
+            calculatedCost?.outputTokenCost,
+
+          totalCost:
+            calculatedCost?.totalCost,
         })
+      );
+
+      return;
+    }
+
+
+    /**
+     * Success
+     */
+    console.log(
+      "[revenium] metering call SUCCESS:",
+      JSON.stringify({
+        status:
+          response.status,
+
+        body,
+
+        model,
+
+        provider:
+          resolvedProvider,
+
+        modelSource:
+          resolvedModelSource,
+
+        inputTokenCount,
+
+        outputTokenCount,
+
+        totalTokenCount,
+
+        inputTokenCost:
+          calculatedCost?.inputTokenCost,
+
+        outputTokenCost:
+          calculatedCost?.outputTokenCost,
+
+        totalCost:
+          calculatedCost?.totalCost,
+
+        transactionId,
+      })
     );
 
   } catch (err) {
+
     console.warn(
-      "[revenium] metering call errored:",
+      "[revenium] metering call ERROR:",
       err?.message || err
     );
+
   }
 }
