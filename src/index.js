@@ -6,12 +6,16 @@
  *
  * Routes:
  *   POST   /chat                → send a message (+ optional attachments), get a reply
+ *   POST   /email               → Gmail Add-on: write/rewrite/improve an email
+ *                                  (auth: X-Stellar-Addon-Key header, NOT CORS —
+ *                                  see src/routes/email.js for why)
  *   GET    /history/:sessionId  → fetch a session's message history
  *   DELETE /history/:sessionId  → clear a session ("new chat")
  */
 
 import { handleChat }                          from "./routes/chat.js";
 import { getSessionHistory, clearSession }     from "./routes/history.js";
+import { handleEmail }                         from "./routes/email.js";
 import { preflightResponse, jsonResponse }     from "./cors.js";
 
 export default {
@@ -24,6 +28,8 @@ export default {
 
     try {
       if (path === "/chat" && method === "POST") return await handleChat(request, env, ctx);
+
+      if (path === "/email" && method === "POST") return await handleEmail(request, env, ctx);
 
       const historyMatch = path.match(/^\/history\/([^/]+)$/);
       if (historyMatch) {

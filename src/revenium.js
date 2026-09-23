@@ -6,7 +6,7 @@
  *      ↓
  *   normalize token usage
  *      ↓
- *   KV pricing cache
+ *   AI_PRICING KV pricing cache
  *      ↓ cache miss
  *   LiteLLM Model Catalog
  *      ↓
@@ -17,8 +17,8 @@
  * Required:
  *   REVENIUM_API_KEY
  *
- * Optional:
- *   REVENIUM_PRICING_CACHE  -> Cloudflare KV binding
+ * KV:
+ *   AI_PRICING
  *
  * Existing values intentionally preserved:
  *   Organization: Stellar Global Supplies
@@ -40,7 +40,6 @@ const MAX_PRICING_PAGES = 10;
 
 /**
  * Resolve Revenium API key.
- * Supports Cloudflare Secrets Store and normal string secrets.
  */
 async function getReveniumApiKey(env) {
   const binding = env.REVENIUM_API_KEY;
@@ -62,6 +61,7 @@ async function getReveniumApiKey(env) {
         "[revenium] failed to resolve API key:",
         err?.message || err
       );
+
       return null;
     }
   }
@@ -71,19 +71,6 @@ async function getReveniumApiKey(env) {
 
 /**
  * Infer provider + model source.
- *
- * Explicit provider/modelSource passed by the caller always wins.
- *
- * Examples:
- *
- * @cf/meta/llama...       -> Cloudflare / Cloudflare
- * @cf/deepseek/...        -> Cloudflare / Cloudflare
- * amazon/...              -> Amazon / Amazon Bedrock
- * anthropic/...            -> Anthropic / DIRECT
- * claude-*                -> Anthropic / DIRECT
- * gpt-*                   -> OpenAI / DIRECT
- * gemini-*                -> Google / DIRECT
- * groq/...                -> Groq / Groq
  */
 function inferProviderAndSource(model) {
   const value = String(model || "").trim();
@@ -99,7 +86,10 @@ function inferProviderAndSource(model) {
   }
 
   // Groq
-  if (lower.startsWith("groq/") || lower.includes("groq")) {
+  if (
+    lower.startsWith("groq/") ||
+    lower.includes("groq")
+  ) {
     return {
       provider: "Groq",
       modelSource: "Groq",
@@ -189,9 +179,7 @@ function inferProviderAndSource(model) {
   }
 
   // DeepSeek
-  if (
-    lower.includes("deepseek")
-  ) {
+  if (lower.includes("deepseek")) {
     return {
       provider: "DeepSeek",
       modelSource: "DIRECT",
@@ -200,9 +188,7 @@ function inferProviderAndSource(model) {
   }
 
   // Qwen
-  if (
-    lower.includes("qwen")
-  ) {
+  if (lower.includes("qwen")) {
     return {
       provider: "Qwen",
       modelSource: "DIRECT",
@@ -218,7 +204,7 @@ function inferProviderAndSource(model) {
 }
 
 /**
- * Normalize a model name for matching.
+ * Normalize model name for matching.
  */
 function normalizeModelName(model) {
   return String(model || "")
@@ -229,23 +215,26 @@ function normalizeModelName(model) {
 }
 
 /**
- * Create stable KV cache key.
+ * Stable KV cache key.
  */
 function pricingCacheKey(provider, model) {
-  return `revenium:pricing:${String(provider || "unknown").toLowerCase()}:${normalizeModelName(model)}`;
+  return `revenium:pricing:${String(
+    provider || "unknown"
+  ).toLowerCase()}:${normalizeModelName(model)}`;
 }
 
 /**
- * Find the exact model inside LiteLLM catalog results.
+ * Find exact model in LiteLLM catalog results.
  */
 function findExactModel(data, requestedModel) {
   if (!Array.isArray(data)) {
     return null;
   }
 
-  const requested = normalizeModelName(requestedModel);
+  const requested =
+    normalizeModelName(requestedModel);
 
-  // First: exact ID
+  // Exact ID
   let match = data.find(
     (item) =>
       normalizeModelName(item?.id) === requested
@@ -255,11 +244,16 @@ function findExactModel(data, requestedModel) {
     return match;
   }
 
-  // Second: provider/model combinations
+  // Exact model_name / base_model
   match = data.find((item) => {
-    const id = normalizeModelName(item?.id);
-    const modelName = normalizeModelName(item?.model_name);
-    const baseModel = normalizeModelName(item?.base_model);
+    const id =
+      normalizeModelName(item?.id);
+
+    const modelName =
+      normalizeModelName(item?.model_name);
+
+    const baseModel =
+      normalizeModelName(item?.base_model);
 
     return (
       id === requested ||
@@ -272,9 +266,10 @@ function findExactModel(data, requestedModel) {
     return match;
   }
 
-  // Third: exact suffix match
+  // Suffix match
   match = data.find((item) => {
-    const id = normalizeModelName(item?.id);
+    const id =
+      normalizeModelName(item?.id);
 
     return (
       id.endsWith(`/${requested}`) ||
@@ -288,30 +283,34 @@ function findExactModel(data, requestedModel) {
 /**
  * Fetch pricing from LiteLLM.
  *
- * Uses:
- *   provider
- *   model
- *   pagination
- *
- * The first request normally finds the model immediately.
- * Pagination is still implemented as a fallback.
+ * Pagination is supported.
  */
-async function fetchLiteLLMPricing(model, litellmProvider) {
-  const provider = litellmProvider || null;
+async function fetchLiteLLMPricing(
+  model,
+  litellmProvider
+) {
+  const provider =
+    litellmProvider || null;
 
   for (
     let page = 1;
     page <= MAX_PRICING_PAGES;
     page++
   ) {
-    const url = new URL(LITELLM_CATALOG_URL);
+    const url =
+      new URL(LITELLM_CATALOG_URL);
 
     if (provider) {
-      url.searchParams.set("provider", provider);
+      url.searchParams.set(
+        "provider",
+        provider
+      );
     }
 
-    // Ask LiteLLM to filter by model.
-    url.searchParams.set("model", model);
+    url.searchParams.set(
+      "model",
+      model
+    );
 
     url.searchParams.set(
       "page",
@@ -329,76 +328,113 @@ async function fetchLiteLLMPricing(model, litellmProvider) {
         provider,
         model,
         page,
-        pageSize: LITELLM_PAGE_SIZE,
+        pageSize:
+          LITELLM_PAGE_SIZE,
       })
     );
 
-    const response = await fetch(url.toString(), {
-      method: "GET",
-      headers: {
-        Accept: "application/json",
-      },
-    });
+    const response =
+      await fetch(url.toString(), {
+        method: "GET",
+
+        headers: {
+          Accept:
+            "application/json",
+        },
+      });
 
     if (!response.ok) {
-      const body = await response.text().catch(() => "");
+      const body =
+        await response
+          .text()
+          .catch(() => "");
 
       throw new Error(
         `LiteLLM catalog ${response.status}: ${body}`
       );
     }
 
-    const result = await response.json();
+    const result =
+      await response.json();
 
-    const data = Array.isArray(result?.data)
-      ? result.data
-      : [];
+    const data =
+      Array.isArray(result?.data)
+        ? result.data
+        : [];
 
-    const match = findExactModel(
-      data,
-      model
-    );
+    const match =
+      findExactModel(
+        data,
+        model
+      );
 
     if (match) {
       const inputCost =
-        Number(match.input_cost_per_token);
+        Number(
+          match.input_cost_per_token
+        );
 
       const outputCost =
-        Number(match.output_cost_per_token);
+        Number(
+          match.output_cost_per_token
+        );
 
       if (
-        Number.isFinite(inputCost) &&
-        Number.isFinite(outputCost)
+        Number.isFinite(
+          inputCost
+        ) &&
+        Number.isFinite(
+          outputCost
+        )
       ) {
         return {
-          model: match.id || model,
-          provider:
-            match.provider || provider || null,
+          model:
+            match.id || model,
 
-          inputCostPerToken: inputCost,
-          outputCostPerToken: outputCost,
+          provider:
+            match.provider ||
+            provider ||
+            null,
+
+          inputCostPerToken:
+            inputCost,
+
+          outputCostPerToken:
+            outputCost,
 
           cacheReadCostPerToken:
             Number.isFinite(
-              Number(match.cache_read_input_token_cost)
+              Number(
+                match.cache_read_input_token_cost
+              )
             )
-              ? Number(match.cache_read_input_token_cost)
+              ? Number(
+                  match.cache_read_input_token_cost
+                )
               : null,
 
           cacheCreationCostPerToken:
             Number.isFinite(
-              Number(match.cache_creation_input_token_cost)
+              Number(
+                match.cache_creation_input_token_cost
+              )
             )
-              ? Number(match.cache_creation_input_token_cost)
+              ? Number(
+                  match.cache_creation_input_token_cost
+                )
               : null,
 
-          source: "litellm",
-          fetchedAt: new Date().toISOString(),
+          source:
+            "litellm",
+
+          fetchedAt:
+            new Date().toISOString(),
         };
       }
     }
 
-    const hasMore = result?.has_more === true;
+    const hasMore =
+      result?.has_more === true;
 
     if (!hasMore) {
       break;
@@ -409,42 +445,52 @@ async function fetchLiteLLMPricing(model, litellmProvider) {
 }
 
 /**
- * Get pricing from KV first.
+ * Get model pricing.
  *
- * KV is optional. If KV is not configured, the Worker
- * simply calls LiteLLM directly.
+ * 1. AI_PRICING KV
+ * 2. LiteLLM
+ * 3. Store LiteLLM result in AI_PRICING
  */
 async function getModelPricing(
   env,
   model,
   litellmProvider
 ) {
-  const cache = env.REVENIUM_PRICING_CACHE;
+  const cache =
+    env.AI_PRICING;
 
-  const cacheKey = pricingCacheKey(
-    litellmProvider,
-    model
-  );
+  const cacheKey =
+    pricingCacheKey(
+      litellmProvider,
+      model
+    );
 
   // ------------------------------------------
-  // 1. KV CACHE
+  // 1. AI_PRICING KV
   // ------------------------------------------
   if (cache) {
     try {
       const cached =
-        await cache.get(cacheKey, "json");
+        await cache.get(
+          cacheKey,
+          "json"
+        );
 
       if (
         cached &&
         Number.isFinite(
-          Number(cached.inputCostPerToken)
+          Number(
+            cached.inputCostPerToken
+          )
         ) &&
         Number.isFinite(
-          Number(cached.outputCostPerToken)
+          Number(
+            cached.outputCostPerToken
+          )
         )
       ) {
         console.log(
-          "[pricing] cache HIT:",
+          "[pricing] AI_PRICING cache HIT:",
           model
         );
 
@@ -452,18 +498,18 @@ async function getModelPricing(
       }
 
       console.log(
-        "[pricing] cache MISS:",
+        "[pricing] AI_PRICING cache MISS:",
         model
       );
     } catch (err) {
       console.warn(
-        "[pricing] KV read failed:",
+        "[pricing] AI_PRICING KV read failed:",
         err?.message || err
       );
     }
   } else {
     console.warn(
-      "[pricing] REVENIUM_PRICING_CACHE not configured — using LiteLLM directly"
+      "[pricing] AI_PRICING binding not configured — using LiteLLM directly"
     );
   }
 
@@ -490,7 +536,8 @@ async function getModelPricing(
       "[pricing] LiteLLM pricing FOUND:",
       JSON.stringify({
         model,
-        provider: litellmProvider,
+        provider:
+          litellmProvider,
         inputCostPerToken:
           pricing.inputCostPerToken,
         outputCostPerToken:
@@ -505,7 +552,9 @@ async function getModelPricing(
       try {
         await cache.put(
           cacheKey,
-          JSON.stringify(pricing),
+          JSON.stringify(
+            pricing
+          ),
           {
             expirationTtl:
               PRICING_CACHE_TTL,
@@ -513,12 +562,12 @@ async function getModelPricing(
         );
 
         console.log(
-          "[pricing] cached for 24h:",
+          "[pricing] stored in AI_PRICING for 24h:",
           model
         );
       } catch (err) {
         console.warn(
-          "[pricing] KV write failed:",
+          "[pricing] AI_PRICING KV write failed:",
           err?.message || err
         );
       }
@@ -536,12 +585,7 @@ async function getModelPricing(
 }
 
 /**
- * Calculate AI cost locally.
- *
- * DO NOT round to cents here.
- *
- * Revenium accepts decimal USD values and we want
- * to preserve very small AI costs.
+ * Calculate cost locally.
  */
 function calculateCost(
   inputTokenCount,
@@ -553,40 +597,37 @@ function calculateCost(
   }
 
   const inputCost =
-    Number(inputTokenCount || 0) *
-    Number(pricing.inputCostPerToken || 0);
+    Number(
+      inputTokenCount || 0
+    ) *
+    Number(
+      pricing.inputCostPerToken || 0
+    );
 
   const outputCost =
-    Number(outputTokenCount || 0) *
-    Number(pricing.outputCostPerToken || 0);
+    Number(
+      outputTokenCount || 0
+    ) *
+    Number(
+      pricing.outputCostPerToken || 0
+    );
 
   const totalCost =
     inputCost + outputCost;
 
   return {
-    inputTokenCost: inputCost,
-    outputTokenCost: outputCost,
+    inputTokenCost:
+      inputCost,
+
+    outputTokenCost:
+      outputCost,
+
     totalCost,
   };
 }
 
 /**
  * Report one AI call to Revenium.
- *
- * Existing callers continue to work:
- *
- * reportUsage(env, {
- *   model,
- *   sessionId,
- *   usage,
- *   operationType,
- *   requestStartTime
- * })
- *
- * Optional:
- *
- * provider
- * modelSource
  */
 export async function reportUsage(
   env,
@@ -596,10 +637,9 @@ export async function reportUsage(
     usage,
     operationType = "CHAT",
     requestStartTime,
-
-    // Optional explicit values.
     provider,
     modelSource,
+    productName,
   }
 ) {
   const apiKey =
@@ -609,6 +649,7 @@ export async function reportUsage(
     console.warn(
       "[revenium] REVENIUM_API_KEY not available — skipping usage report"
     );
+
     return;
   }
 
@@ -632,6 +673,7 @@ export async function reportUsage(
     console.warn(
       "[revenium] no token usage found — skipping usage report"
     );
+
     return;
   }
 
@@ -639,13 +681,17 @@ export async function reportUsage(
   // PROVIDER + MODEL SOURCE
   // ------------------------------------------
   const inferred =
-    inferProviderAndSource(model);
+    inferProviderAndSource(
+      model
+    );
 
   const resolvedProvider =
-    provider || inferred.provider;
+    provider ||
+    inferred.provider;
 
   const resolvedModelSource =
-    modelSource || inferred.modelSource;
+    modelSource ||
+    inferred.modelSource;
 
   const litellmProvider =
     inferred.litellmProvider;
@@ -672,10 +718,15 @@ export async function reportUsage(
       "[pricing] CALCULATED COST:",
       JSON.stringify({
         model,
-        provider: resolvedProvider,
-        modelSource: resolvedModelSource,
+
+        provider:
+          resolvedProvider,
+
+        modelSource:
+          resolvedModelSource,
 
         inputTokenCount,
+
         outputTokenCount,
 
         inputCostPerToken:
@@ -704,14 +755,18 @@ export async function reportUsage(
   // ------------------------------------------
   // TIMING
   // ------------------------------------------
-  const now = new Date();
+  const now =
+    new Date();
 
   const requestTime =
     requestStartTime
-      ? new Date(requestStartTime)
+      ? new Date(
+          requestStartTime
+        )
       : now;
 
-  const responseTime = now;
+  const responseTime =
+    now;
 
   const requestDuration =
     Math.max(
@@ -729,7 +784,8 @@ export async function reportUsage(
   const payload = {
     transactionId,
 
-    model: model || "unknown",
+    model:
+      model || "unknown",
 
     provider:
       resolvedProvider,
@@ -761,9 +817,6 @@ export async function reportUsage(
         }
       : {}),
 
-    // ----------------------------------------
-    // OUR CALCULATED COST
-    // ----------------------------------------
     ...(cost
       ? {
           inputTokenCost:
@@ -775,7 +828,8 @@ export async function reportUsage(
           totalCost:
             cost.totalCost,
 
-          costType: "AI",
+          costType:
+            "AI",
         }
       : {}),
 
@@ -790,12 +844,14 @@ export async function reportUsage(
 
     requestDuration,
 
-    stopReason: "STOP",
+    stopReason:
+      "STOP",
 
     organizationName:
       ORGANIZATION_ID,
 
     productName:
+      productName ||
       PRODUCT_ID,
 
     operationType,
@@ -810,9 +866,14 @@ export async function reportUsage(
   console.log(
     "[revenium] FINAL COST PAYLOAD:",
     JSON.stringify({
-      model: payload.model,
-      provider: payload.provider,
-      modelSource: payload.modelSource,
+      model:
+        payload.model,
+
+      provider:
+        payload.provider,
+
+      modelSource:
+        payload.modelSource,
 
       inputTokenCount:
         payload.inputTokenCount,
@@ -824,13 +885,16 @@ export async function reportUsage(
         payload.totalTokenCount,
 
       inputTokenCost:
-        payload.inputTokenCost ?? null,
+        payload.inputTokenCost ??
+        null,
 
       outputTokenCost:
-        payload.outputTokenCost ?? null,
+        payload.outputTokenCost ??
+        null,
 
       totalCost:
-        payload.totalCost ?? null,
+        payload.totalCost ??
+        null,
     })
   );
 
@@ -859,7 +923,9 @@ export async function reportUsage(
           },
 
           body:
-            JSON.stringify(payload),
+            JSON.stringify(
+              payload
+            ),
         }
       );
 
@@ -897,7 +963,8 @@ export async function reportUsage(
             payload.totalTokenCount,
 
           totalCost:
-            payload.totalCost ?? null,
+            payload.totalCost ??
+            null,
         })
       );
 
@@ -929,20 +996,21 @@ export async function reportUsage(
           payload.totalTokenCount,
 
         inputTokenCost:
-          payload.inputTokenCost ?? null,
+          payload.inputTokenCost ??
+          null,
 
         outputTokenCost:
-          payload.outputTokenCost ?? null,
+          payload.outputTokenCost ??
+          null,
 
         totalCost:
-          payload.totalCost ?? null,
+          payload.totalCost ??
+          null,
 
         transactionId,
       })
     );
   } catch (err) {
-    // Never allow Revenium/LiteLLM/KV issues
-    // to break the actual AI request.
     console.warn(
       "[revenium] metering call errored:",
       err?.message || err
@@ -959,9 +1027,15 @@ function normalizeUsage(usage) {
       inputTokenCount: 0,
       outputTokenCount: 0,
       totalTokenCount: 0,
-      reasoningTokenCount: null,
-      cacheCreationTokenCount: null,
-      cacheReadTokenCount: null,
+
+      reasoningTokenCount:
+        null,
+
+      cacheCreationTokenCount:
+        null,
+
+      cacheReadTokenCount:
+        null,
     };
   }
 
@@ -985,8 +1059,8 @@ function normalizeUsage(usage) {
     Number(
       usage.total_tokens ??
         usage.totalTokenCount ??
-        (inputTokenCount +
-          outputTokenCount)
+        inputTokenCount +
+          outputTokenCount
     );
 
   const reasoningTokenCount =
@@ -1008,19 +1082,42 @@ function normalizeUsage(usage) {
     inputTokenCount,
     outputTokenCount,
     totalTokenCount,
+
     reasoningTokenCount:
       reasoningTokenCount != null
-        ? Number(reasoningTokenCount)
+        ? Number(
+            reasoningTokenCount
+          )
         : null,
 
     cacheCreationTokenCount:
       cacheCreationTokenCount != null
-        ? Number(cacheCreationTokenCount)
+        ? Number(
+            cacheCreationTokenCount
+          )
         : null,
 
     cacheReadTokenCount:
       cacheReadTokenCount != null
-        ? Number(cacheReadTokenCount)
+        ? Number(
+            cacheReadTokenCount
+          )
         : null,
   };
+}
+
+/**
+ * Rough token estimate for providers that don't return usage.
+ */
+export function estimateTokens(text) {
+  if (!text) {
+    return 0;
+  }
+
+  return Math.max(
+    1,
+    Math.ceil(
+      String(text).length / 4
+    )
+  );
 }
