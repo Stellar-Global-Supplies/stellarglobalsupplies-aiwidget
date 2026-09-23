@@ -11,6 +11,11 @@ invocation_logs = true
 [vars]
 ENVIRONMENT       = "production"
 ALLOWED_ORIGIN    = "https://orders.stellarglobalsupplies.com"
+
+[[kv_namespaces]]
+binding = "AI_PRICING"
+id = "9d0a2c5de0164a08a1551ebe87e65299"
+
 # Kept as a fallback/reference only — NOT used for the actual tool-call fetch.
 # Cloudflare blocks a Worker from fetch()-ing another Worker's *.workers.dev
 # hostname directly (error 1042), so the real call goes through the service
