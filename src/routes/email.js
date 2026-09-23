@@ -10,7 +10,9 @@
  * server-to-server from Google's infrastructure, with no Origin header
  * for CORS to check. So /email is gated by a separate shared-secret
  * header instead. The secret lives only in:
- *   - this Worker's secret store (ADDON_SHARED_SECRET)
+ *   - Cloudflare Secrets Store (ADDON_SHARED_SECRET binding — same
+ *     account-level store pattern as REVENIUM_API_KEY, resolved via
+ *     env.ADDON_SHARED_SECRET.get())
  *   - the Apps Script project's Script Properties (server-side, never
  *     rendered into the add-on's UI/HTML, never visible to the Gmail user)
  * It is never sent to, or readable from, the Gmail client itself.
@@ -76,15 +78,41 @@ Rules:
 `.trim(),
 };
 
-function isAuthorized(request, env) {
-  const expected = env.ADDON_SHARED_SECRET;
-  if (!expected) return false; // fail closed if the secret isn't configured
+// Resolves the add-on's shared secret. Supports both a Secrets Store
+// binding (env.ADDON_SHARED_SECRET.get(), same pattern as REVENIUM_API_KEY
+// in revenium.js) and a plain `wrangler secret` string, so this works
+// however you choose to store it.
+async function getAddonSharedSecret(env) {
+  const binding = env.ADDON_SHARED_SECRET;
+
+  if (!binding) return null;
+
+  if (typeof binding === "string") {
+    return binding.trim();
+  }
+
+  if (typeof binding.get === "function") {
+    try {
+      const value = await binding.get();
+      return value ? String(value).trim() : null;
+    } catch (err) {
+      console.warn("[email] failed to resolve ADDON_SHARED_SECRET:", err?.message || err);
+      return null;
+    }
+  }
+
+  return null;
+}
+
+async function isAuthorized(request, env) {
+  const expected = await getAddonSharedSecret(env);
+  if (!expected) return false; // fail closed if the secret isn't configured/resolvable
   const got = request.headers.get("x-stellar-addon-key") || "";
   return got.length > 0 && got === expected;
 }
 
 export async function handleEmail(request, env, ctx) {
-  if (!isAuthorized(request, env)) {
+  if (!(await isAuthorized(request, env))) {
     return jsonResponse({ message: "Unauthorized" }, 401, env);
   }
 

@@ -62,6 +62,18 @@ binding     = "REVENIUM_API_KEY"
 store_id    = "2556bcd9458349f6b4ff2a3fc93bdba1"
 secret_name = "REVENIUM_API_KEY"
 
+# Gmail Add-on shared secret — same Cloudflare Secrets Store binding pattern
+# as REVENIUM_API_KEY above. Authenticates the Apps Script project (server-
+# side) to this Worker's /email route; unrelated to REVENIUM_API_KEY's store
+# entry, just reuses the same store/mechanism. Can live in the same store as
+# REVENIUM_API_KEY or a separate one — either works, just update store_id
+# below to match wherever you create it.
+# Accessed in code via: await env.ADDON_SHARED_SECRET.get()  (see src/routes/email.js)
+[[secrets_store_secrets]]
+binding     = "ADDON_SHARED_SECRET"
+store_id    = "2556bcd9458349f6b4ff2a3fc93bdba1"
+secret_name = "ADDON_SHARED_SECRET"
+
 # ── Deployment ───────────────────────────────────────────────────────────────
 # 1. wrangler d1 create sgs-order-ai-widget-db   → paste database_id above
 # 2. wrangler d1 execute sgs-order-ai-widget-db --file=schema.sql
@@ -70,5 +82,12 @@ secret_name = "REVENIUM_API_KEY"
 #      wrangler secrets-store secret create <STORE_ID> \
 #        --name REVENIUM_API_KEY --scopes workers --remote
 #    Then paste the real store_id above into [[secrets_store_secrets]].
+# 3b. Same, for the Gmail Add-on's shared secret:
+#      openssl rand -hex 32   → generate the value first, keep it safe
+#      wrangler secrets-store secret create <STORE_ID> \
+#        --name ADDON_SHARED_SECRET --scopes workers --remote
+#      (paste the generated value when prompted)
+#    Then paste the real store_id above into the ADDON_SHARED_SECRET block
+#    (same store_id as REVENIUM_API_KEY if you're reusing one store).
 # 4. wrangler deploy
 # 5. In orders-frontend .env: REACT_APP_AI_WIDGET_URL = https://sgs-ai-widget.workwithprasadbhavsar.workers.dev
