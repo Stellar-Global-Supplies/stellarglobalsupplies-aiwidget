@@ -134,7 +134,7 @@ export async function handleEmail(request, env, ctx) {
     usage: aiResponse?.usage,
     operationType: "EMAIL_ADDON",
     requestStartTime: start,
-    productName: "stellar-gmail-ai",
+    productName: "stellar-ai-gmail",
   }));
 
   const resultBody = (aiResponse?.response || "").trim();
