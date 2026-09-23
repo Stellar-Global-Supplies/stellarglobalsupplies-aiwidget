@@ -266,10 +266,7 @@ export async function handleEmail(request, env, ctx) {
   // EXTRACT AI RESULT
   // ------------------------------------------
 
-  const resultBody =
-    typeof aiResponse?.response === "string"
-      ? aiResponse.response.trim()
-      : "";
+  const resultBody = aiResponse?.choices?.[0]?.message?.content?.trim() || "";
 
   // ------------------------------------------
   // AI RETURNED NOTHING
