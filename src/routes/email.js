@@ -176,6 +176,141 @@ Rules:
   say that plainly instead of fabricating a profile.
 - Plain text only, conversational tone, no markdown headers, no preamble.
 `.trim(),
+
+  suggest_reply: `
+You are an email-reply-drafting assistant embedded in Gmail via a "Stellar AI"
+add-on. You're given the text of an email the user received. Draft a reasonable
+reply on the user's behalf.
+
+Rules:
+- Output the reply BODY only — no subject line, no "Subject:" prefix, no
+  markdown code fences, no commentary before or after.
+- Address whatever the original email is asking or implying needs a response
+  — a question, a request, a proposed date, etc.
+- Keep it genuinely short unless the original email clearly warrants a longer
+  reply — most replies should be a few sentences, not an essay.
+- Match a professional-but-natural tone unless the original email's tone
+  implies otherwise (e.g. a casual note from a colleague).
+- Do not invent specific commitments, dates, prices, or facts the user hasn't
+  provided — use placeholders like [date] or [amount] if a concrete answer is
+  needed but not knowable from the email alone.
+- Use plain text with proper paragraph breaks.
+- Do not add a signature/name/title unless the original thread's tone strongly
+  implies a formal sign-off is expected — a placeholder [Your name] is fine
+  if so.
+`.trim(),
+
+  extract_event: `
+You are an assistant embedded in Gmail via a "Stellar AI" add-on that finds a
+schedulable event (a meeting, call, deadline, or appointment) mentioned in an
+email, so it can be added to the user's calendar.
+
+You'll be given today's date/timezone and the email text. Respond with ONLY a
+single JSON object, no markdown code fences, no commentary before or after —
+just the raw JSON. Use this exact shape:
+
+{
+  "found": true or false,
+  "title": "short event title",
+  "date": "YYYY-MM-DD",
+  "time": "HH:MM" in 24-hour format, or null if no specific time is mentioned (all-day event),
+  "durationMinutes": a reasonable integer (default 60 if unstated, use 30 for quick calls, more for longer stated durations),
+  "location": "location or video-call link if mentioned, else empty string",
+  "description": "one short sentence of context, else empty string"
+}
+
+Rules:
+- Set "found" to false (and leave other fields as reasonable empty defaults)
+  if the email doesn't clearly describe a specific, schedulable date/event —
+  do not invent a date that isn't actually implied by the email.
+- Resolve relative dates ("next Tuesday", "tomorrow", "in two weeks") into an
+  actual calendar date using the provided "today" reference.
+- If multiple candidate dates/events are mentioned, pick the single most
+  clearly-intended one (e.g. the actual meeting time, not a "sent on" date).
+- Output ONLY the JSON object. No prose, no markdown fences, nothing else.
+`.trim(),
+
+  suggest_reply_options: `
+You are an email-reply-drafting assistant embedded in Gmail via a "Stellar AI"
+add-on. You're given the text of an email the user received. Draft THREE
+distinct reply options, each taking a genuinely different approach suited to
+THIS specific email — not three generic variations of the same reply.
+
+Respond with ONLY a single JSON object, no markdown code fences, no commentary
+before or after — just the raw JSON. Use this exact shape:
+
+{
+  "options": [
+    { "label": "2-4 word label for this approach", "body": "full reply body" },
+    { "label": "2-4 word label for this approach", "body": "full reply body" },
+    { "label": "2-4 word label for this approach", "body": "full reply body" }
+  ]
+}
+
+Rules:
+- Pick 3 approaches that actually make sense for what THIS email is asking —
+  examples of the kind of distinction to aim for: a quick one-line
+  acknowledgment vs. a full detailed reply, saying yes vs. proposing an
+  alternative, accepting vs. politely declining/deferring. Don't force a
+  "decline" option onto an email where declining makes no sense (e.g. a
+  simple FYI or thank-you note) — in those cases, vary on length/formality/
+  next-steps instead.
+- Each "label" should describe the approach, not just restate "Reply 1" /
+  "Reply 2" — e.g. "Quick yes", "Ask for more time", "Decline politely".
+- Each "body" follows the same rules as a normal reply: plain text, proper
+  paragraph breaks, no subject line, no invented facts/commitments/dates
+  beyond what's in the original email (use [placeholders] if a concrete
+  answer is needed but not knowable), no signature unless clearly implied.
+- Keep each body genuinely short unless the email clearly warrants more.
+- Output ONLY the JSON object.
+`.trim(),
+
+  summarize_document: `
+You are a document-summarizing assistant embedded in Gmail via a "Stellar AI"
+add-on. You're given the extracted text of a file attached to an email (a PDF,
+Word doc, or plain text file). Summarize it.
+
+Rules:
+- Lead with 1-2 sentences on what kind of document this is and what it's
+  about.
+- Follow with a short bulleted list of the key points, figures, or sections —
+  only include this if the document actually has multiple distinct points
+  worth separating out.
+- If the document appears to require a decision, signature, response, or
+  action from the reader, say so explicitly.
+- If the extracted text looks garbled, truncated, or clearly incomplete
+  (common with OCR/PDF extraction), say so plainly rather than confidently
+  summarizing partial content as if it were the whole document.
+- Plain text only. No markdown headers, no "Here's a summary:" preamble.
+`.trim(),
+
+  triage_pending: `
+You are an inbox-triage assistant embedded in Gmail via a "Stellar AI" add-on.
+You're given a numbered list of email threads where the user has NOT sent the
+most recent message — meaning they are technically "unreplied." Your job is
+to filter this down to ONLY the ones that genuinely need a reply from the
+user, and explain why, in ONE short line each.
+
+Do NOT assume every unreplied thread needs action — most inboxes have plenty
+of threads where no reply is actually expected: automated notifications,
+FYI-only messages, threads where the last message was just a "thanks!" or
+similar closing remark, marketing/newsletter content, or messages where the
+user was only cc'd for visibility.
+
+Rules:
+- Output ONLY the threads that genuinely warrant a reply. Completely OMIT any
+  line for a thread that doesn't need one — do not write "no action needed"
+  lines, just leave those threads out entirely.
+- Format each included line as: "N. <why this needs a reply, one short
+  sentence>" using the SAME number as given for that thread — do not
+  renumber sequentially, keep the original numbers so they can be matched
+  back to the subject/sender list.
+- If a thread implies real urgency (a deadline, a blocking question, someone
+  explicitly waiting on the user), say so in the line.
+- If NONE of the threads given genuinely need a reply, output exactly:
+  NONE_PENDING
+- Plain text only, no markdown, no preamble, no summary paragraph.
+`.trim(),
 };
 
 const VALID_ACTIONS = Object.keys(SYSTEM_PROMPTS);
@@ -278,7 +413,10 @@ export async function handleEmail(request, env, ctx) {
   // digest / explain_sender: an array of short per-email strings instead of
   // one blob of text. Capped at 15 items regardless of what's sent — keeps
   // a single AI call's cost/latency bounded even if the caller sends more.
-  const items = Array.isArray(body.items) ? body.items.slice(0, 15) : [];
+  // triage_pending scans more threads than digest (it's filtering, not
+  // describing every one), so it gets a higher item cap.
+  const itemCap = action === "triage_pending" ? 25 : 15;
+  const items = Array.isArray(body.items) ? body.items.slice(0, itemCap) : [];
 
   const senderLabel = (body.senderLabel || "").toString().slice(0, 200);
 
@@ -286,14 +424,15 @@ export async function handleEmail(request, env, ctx) {
 
   if (action === "write") {
     userContent = prompt;
-  } else if (action === "digest") {
+  } else if (action === "digest" || action === "triage_pending") {
     userContent = joinNumberedItems(items);
   } else if (action === "explain_sender") {
     userContent =
       (senderLabel ? `Sender: ${senderLabel}\n\n` : "") +
       joinNumberedItems(items);
   } else {
-    // rewrite, improve, summarize, explain
+    // rewrite, improve, summarize, explain, suggest_reply, suggest_reply_options,
+    // extract_event, summarize_document
     userContent = draftText;
   }
 
@@ -301,7 +440,7 @@ export async function handleEmail(request, env, ctx) {
     const fieldHint =
       action === "write"
         ? "prompt is required"
-        : action === "digest" || action === "explain_sender"
+        : action === "digest" || action === "explain_sender" || action === "triage_pending"
         ? "items is required (non-empty array)"
         : "draftText is required";
 
@@ -388,11 +527,20 @@ export async function handleEmail(request, env, ctx) {
 
   const resultBody = aiResponse?.choices?.[0]?.message?.content?.trim() || "";
 
+  // extract_event and suggest_reply_options both return raw JSON for Apps
+  // Script to parse. Models occasionally wrap it in ```json fences despite
+  // being told not to — strip those defensively rather than trust every
+  // model/prompt run to comply.
+  const JSON_ACTIONS = ["extract_event", "suggest_reply_options"];
+  const cleanedResultBody = JSON_ACTIONS.includes(action)
+    ? resultBody.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim()
+    : resultBody;
+
   // ------------------------------------------
   // AI RETURNED NOTHING
   // ------------------------------------------
 
-  if (!resultBody) {
+  if (!cleanedResultBody) {
     console.error(
       "[email] AI returned no usable response"
     );
@@ -415,13 +563,13 @@ export async function handleEmail(request, env, ctx) {
     "[email] SUCCESS:",
     JSON.stringify({
       action,
-      responseLength: resultBody.length,
+      responseLength: cleanedResultBody.length,
     })
   );
 
   return jsonResponse(
     {
-      body: resultBody,
+      body: cleanedResultBody,
     },
     200,
     env
