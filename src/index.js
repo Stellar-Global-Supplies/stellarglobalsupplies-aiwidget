@@ -6,7 +6,8 @@
  *
  * Routes:
  *   POST   /chat                → send a message (+ optional attachments), get a reply
- *   POST   /email               → Gmail Add-on: write/rewrite/improve an email
+ *   POST   /email               → Gmail Add-on: write/rewrite/improve/summarize/
+ *                                  explain/digest/explain_sender for an email
  *                                  (auth: X-Stellar-Addon-Key header, NOT CORS —
  *                                  see src/routes/email.js for why)
  *   GET    /history/:sessionId  → fetch a session's message history

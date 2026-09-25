@@ -1,5 +1,6 @@
 /**
- * Gmail Add-on endpoint — write / rewrite / improve an email.
+ * Gmail Add-on endpoint — write / rewrite / improve / summarize / explain /
+ * digest / explain_sender.
  *
  * Reuses the SAME Workers AI binding, model, and Revenium metering as
  * /chat. No separate AI backend, no new API keys shipped to the client.
@@ -100,8 +101,84 @@ Rules:
 - If the draft is empty or nonsensical, say so plainly in one short sentence
   instead of fabricating an email.
 `.trim(),
+
+  summarize: `
+You are an email-summarizing assistant embedded in Gmail via a "Stellar AI" add-on.
+You're given the text of an email (sometimes with quoted thread history below
+the newest message). Summarize it.
+
+Rules:
+- Lead with a 1-2 sentence summary of what the email is about and what (if
+  anything) it's asking the reader to do.
+- Add a short bulleted list of key points ONLY if the email has more than one
+  distinct point worth separating out — for a short/simple email, the 1-2
+  sentence summary alone is enough.
+- If the email is clearly asking for a decision, reply, or action, call that
+  out explicitly (e.g. "Action needed: ...").
+- Focus on the newest message; only pull from quoted/forwarded history below
+  it if needed to make the summary make sense.
+- Plain text only. No markdown headers, no "Here's a summary:" preamble.
+`.trim(),
+
+  explain: `
+You are an email-explaining assistant embedded in Gmail via a "Stellar AI" add-on.
+You're given the text of an email (or a snippet of one) that the user doesn't
+fully understand or wants more context on. Explain it in plain language.
+
+Rules:
+- Explain what the email is actually saying, including any jargon, technical
+  terms, unusual phrasing, or implied context — spell out what it means in
+  practice, not just what it literally says.
+- If something is ambiguous or could be read more than one way, say so and
+  give the likely interpretations rather than picking one silently.
+- If the email implies a deadline, obligation, or consequence, call it out
+  explicitly even if it wasn't stated directly.
+- Keep it conversational and clear — write for someone who wants to
+  understand quickly, not a formal report.
+- Plain text only. No markdown headers.
+`.trim(),
+
+  digest: `
+You are an inbox-digest assistant embedded in Gmail via a "Stellar AI" add-on.
+You're given a numbered list of recent emails, each with its sender and
+subject and a short snippet of the body. For EACH numbered email, write one
+short line capturing what it's about and whether it looks like it needs a
+reply/action from the user.
+
+Rules:
+- Output one line per email, in the SAME numbered order as given — do not
+  skip, merge, or reorder any.
+- Format each line as: "N. <one-line take, plain language>" — do not repeat
+  the sender or subject back, the user already sees those separately.
+- If an email clearly needs a reply/decision, end that line with
+  " — needs reply" or " — action needed" as appropriate; otherwise leave it
+  off entirely (don't write "no action needed" every time — only flag the
+  ones that need something).
+- Keep each line under ~20 words.
+- Plain text only, no markdown, no preamble, no summary paragraph before or
+  after the numbered list.
+`.trim(),
+
+  explain_sender: `
+You are an assistant embedded in Gmail via a "Stellar AI" add-on that helps
+the user quickly understand who they're corresponding with. You're given an
+email address/name and a short set of recent email snippets (subject + a bit
+of body) from or to that person.
+
+Rules:
+- In 2-4 sentences, describe who this person appears to be and what you
+  two have been discussing, based ONLY on the snippets given — do not guess
+  at their job title, company, or relationship beyond what's evident in the
+  text.
+- If there's a clear open item, pending question, or something awaiting a
+  reply from either side, mention it.
+- If the snippets are too thin or unrelated to say anything meaningful,
+  say that plainly instead of fabricating a profile.
+- Plain text only, conversational tone, no markdown headers, no preamble.
+`.trim(),
 };
 
+const VALID_ACTIONS = Object.keys(SYSTEM_PROMPTS);
 
 // Resolves the add-on's shared secret.
 async function getAddonSharedSecret(env) {
@@ -140,6 +217,15 @@ async function isAuthorized(request, env) {
   return got.length > 0 && got === expected;
 }
 
+// digest/explain_sender send an array of short strings (one per email) that
+// we join into one block of text for the model, each numbered so the model
+// can echo the same numbering back in its reply.
+function joinNumberedItems(items) {
+  return items
+    .map((item, i) => `${i + 1}. ${String(item || "").slice(0, 1500)}`)
+    .join("\n\n");
+}
+
 export async function handleEmail(request, env, ctx) {
   // ------------------------------------------
   // AUTH
@@ -171,6 +257,16 @@ export async function handleEmail(request, env, ctx) {
 
   const action = body.action;
 
+  if (!VALID_ACTIONS.includes(action)) {
+    return jsonResponse(
+      {
+        message: `action must be one of: ${VALID_ACTIONS.join(", ")}`,
+      },
+      400,
+      env
+    );
+  }
+
   const prompt = (body.prompt || "")
     .toString()
     .slice(0, MAX_INPUT_CHARS);
@@ -179,30 +275,38 @@ export async function handleEmail(request, env, ctx) {
     .toString()
     .slice(0, MAX_INPUT_CHARS);
 
-  if (!["write", "rewrite", "improve"].includes(action)) {
-    return jsonResponse(
-      {
-        message:
-          "action must be one of: write, rewrite, improve",
-      },
-      400,
-      env
-    );
+  // digest / explain_sender: an array of short per-email strings instead of
+  // one blob of text. Capped at 15 items regardless of what's sent — keeps
+  // a single AI call's cost/latency bounded even if the caller sends more.
+  const items = Array.isArray(body.items) ? body.items.slice(0, 15) : [];
+
+  const senderLabel = (body.senderLabel || "").toString().slice(0, 200);
+
+  let userContent;
+
+  if (action === "write") {
+    userContent = prompt;
+  } else if (action === "digest") {
+    userContent = joinNumberedItems(items);
+  } else if (action === "explain_sender") {
+    userContent =
+      (senderLabel ? `Sender: ${senderLabel}\n\n` : "") +
+      joinNumberedItems(items);
+  } else {
+    // rewrite, improve, summarize, explain
+    userContent = draftText;
   }
 
-  const userContent =
-    action === "write"
-      ? prompt
-      : draftText;
-
   if (!userContent.trim()) {
+    const fieldHint =
+      action === "write"
+        ? "prompt is required"
+        : action === "digest" || action === "explain_sender"
+        ? "items is required (non-empty array)"
+        : "draftText is required";
+
     return jsonResponse(
-      {
-        message:
-          action === "write"
-            ? "prompt is required"
-            : "draftText is required",
-      },
+      { message: fieldHint },
       400,
       env
     );
@@ -254,26 +358,6 @@ export async function handleEmail(request, env, ctx) {
   console.log(
     "[email] AI RESPONSE:",
     JSON.stringify(aiResponse)
-  );
-
-  console.log(
-    "[email] AI RESPONSE SUMMARY:",
-    JSON.stringify({
-      responseType: typeof aiResponse?.response,
-
-      responseLength:
-        typeof aiResponse?.response === "string"
-          ? aiResponse.response.length
-          : null,
-
-      hasResponse:
-        typeof aiResponse?.response === "string" &&
-        aiResponse.response.length > 0,
-
-      hasUsage: !!aiResponse?.usage,
-
-      usage: aiResponse?.usage || null,
-    })
   );
 
   // ------------------------------------------
